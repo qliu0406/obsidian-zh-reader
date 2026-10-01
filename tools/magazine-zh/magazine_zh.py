@@ -912,19 +912,24 @@ def translate_article(epub, article, terms, kind='magazine'):
         previous = next((paras[j]['text'][-500:] for j in range(group[0] - 1, -1, -1) if paras[j]['text']), '')
         text = ' '.join(x['en'] for x in items) + ' ' + article['title']
         payload = {'title': article['title'], 'previous': previous, 'terms': terms.relevant(text), 'items': items}
-        got, rung = {}, start
-        for attempt in range(2):  # a malformed reply on the same rung gets one more try
+        got, rung, error = None, start, ''
+        for attempt in range(3):  # network/service hiccups (e.g. the lid closed mid-request) retry on the same rung
             try:
                 result, model, rung = ask(article_prompt(kind) + json.dumps(payload, ensure_ascii=False), 'article', 300, start)
             except QuotaError:
                 raise
-            except Exception:  # noqa: BLE001 - transient failure: try again
+            except Exception as exc:  # noqa: BLE001 - transient failure: wait a little and try again
+                error = str(exc)[:120]
+                time.sleep(20 * (attempt + 1))
                 continue
             got = {int(x['id']): x for x in result.get('items', []) if int(x['id']) in group}
             terms.add(result.get('terms', []))
             if model not in done['models']:
                 done['models'].append(model)
             break
+        if got is None:
+            # Not a translation-quality problem: don't send it up the (pricier) ladder; a later run fills it in.
+            raise RuntimeError(f'网络或服务暂时出错（{error}）')
         # Review loop: problems and doubts go up one rung at a time.
         while True:
             problems = {i: check_block(paras[i]['text'], got.get(i)) for i in group}
