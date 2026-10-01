@@ -721,7 +721,8 @@ def list_library():
                           'author': '' if kind == 'magazine' else meta.get('creator', ''), 'drm': drm,
                           'mtime': path.stat().st_mtime, 'imported': ready,
                           'index': public(state)['index'] if ready else '',
-                          'translated': sum(1 for a in state['articles'] if a.get('note')) if ready else 0})
+                          'translated': sum(1 for a in state['articles'] if a.get('note')) if ready else 0,
+                          'total': len(state['articles']) if ready else 0})
     return sorted(items, key=lambda x: x['mtime'], reverse=True)
 
 
@@ -759,6 +760,9 @@ def do_import(epub, model):
     meta, articles = split_articles(epub)
     if not articles:
         raise SystemExit('没能从这个 EPUB 里识别出正文。它可能是图片版（每页是图片），或目录结构特殊。')
+    sample = ' '.join(p['text'] for a in articles[:5] for p in a['paras'][:20] if p['text'])
+    if len(CJK.findall(sample)) > 0.3 * max(1, len(re.sub(r'\s', '', sample))):
+        raise SystemExit('这本书的正文主要是中文，不需要翻译。')  # metadata said otherwise: trust the text
     kind, name, date = describe(meta, epub_meta(epub)[1], Path(epub).stem)
     sections = []
     for a in articles:

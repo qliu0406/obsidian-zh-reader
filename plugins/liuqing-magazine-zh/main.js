@@ -192,9 +192,31 @@ function applyOutput(state, raw) {
 }
 
 /** Library items worth auto-importing: new since `since`, not imported, readable, not tried at this version. */
-function autoCandidates(items, since, tried) {
-  return items.filter(x => !x.imported && !x.drm && x.mtime * 1000 > since && tried[x.path] !== x.mtime)
+/** New EPUBs (added after auto-translation was switched on) that still need work: no Chinese TOC yet, or not every
+ *  article/chapter translated. Ones given up on (repeated failures) are skipped. Oldest first. */
+function autoCandidates(items, since, records) {
+  return items.filter(x => !x.drm && x.mtime * 1000 > since && !(records[x.path] && records[x.path].gaveUp)
+    && (!x.imported || (x.total && x.translated < x.total)))
     .sort((a, b) => a.mtime - b.mtime);
+}
+
+/** "…用量已到上限，Oct 1st, 2026 2:08 AM 恢复…" or "…，3:57 AM 恢复…" → epoch ms + 5 min; otherwise now + 5 h. */
+function resumeTime(text, now) {
+  now = now || Date.now();
+  const fallback = now + 5 * 3600 * 1000;
+  const m = /用量已到上限，(.+?) 恢复/.exec(text || '');
+  if (!m) return fallback;
+  const when = m[1].replace(/(\d)(st|nd|rd|th)\b/, '$1').trim();
+  let t = Date.parse(when);
+  const clock = /^(\d{1,2}):(\d{2})\s*([AP]M)$/i.exec(when);
+  if (Number.isNaN(t) && clock) {
+    const d = new Date(now);
+    let hour = Number(clock[1]) % 12 + (clock[3].toUpperCase() === 'PM' ? 12 : 0);
+    d.setHours(hour, Number(clock[2]), 0, 0);
+    t = d.getTime() <= now ? d.getTime() + 24 * 3600 * 1000 : d.getTime();
+  }
+  if (Number.isNaN(t) || t <= now || t > fallback) return fallback;
+  return t + 5 * 60 * 1000;
 }
 
 function displayName(item) {
@@ -601,9 +623,9 @@ class MagazinePanel extends MarkdownRenderChild {
     const run = this.plugin.run;
     if (run && run.state.status === 'running') {
       const ids = run.picked || [];
-      const done = ids.filter(id => run.state.articles[id] && run.state.articles[id].status === 'done').length;
+      const done = Object.values(run.state.articles).filter(a => a.status === 'done').length;
       const line = el.createDiv({ cls: 'lmz-panel-line' });
-      line.setText(run.action === 'translate' ? `《${run.epub.name}》正在翻译 ${done}/${ids.length}` : `《${run.epub.name}》正在生成中文目录${run.auto ? '（自动）' : ''}`);
+      line.setText(run.action === 'translate' ? `《${run.epub.name}》正在${run.auto ? '自动' : ''}翻译 ${done}/${run.auto ? (run.total || '…') : ids.length}` : `《${run.epub.name}》正在生成中文目录${run.auto ? '（自动）' : ''}`);
       el.createEl('button', { text: '查看进度' }).addEventListener('click', () => this.plugin.openModal());
     }
     renderLibrary(el, this.plugin, epub => this.plugin.openModal(epub), 6);
@@ -612,14 +634,15 @@ class MagazinePanel extends MarkdownRenderChild {
     const auto = row.createEl('label', { cls: 'lmz-auto' });
     const box = auto.createEl('input', { type: 'checkbox' });
     box.checked = this.plugin.settings.auto;
-    auto.createSpan({ text: '新加入的 EPUB 自动生成中文目录' });
+    auto.createSpan({ text: '新加入的 EPUB 自动翻译全文' });
     box.addEventListener('change', () => { this.plugin.settings.auto = box.checked; this.plugin.saveData(this.plugin.settings); });
   }
 }
 
 module.exports = class MagazineZhPlugin extends Plugin {
   async onload() {
-    this.settings = Object.assign({ model: DEFAULT_MODEL, auto: true, since: 0, tried: {} }, await this.loadData());
+    this.settings = Object.assign({ model: DEFAULT_MODEL, auto: true, since: 0, records: {}, pausedUntil: 0 }, await this.loadData());
+    if (!this.settings.records) this.settings.records = {};
     if (!MODELS[this.settings.model]) this.settings.model = DEFAULT_MODEL;
     if (!this.settings.since) {
       // First run: start watching from now on; nothing already in the library is processed automatically.
@@ -688,15 +711,56 @@ module.exports = class MagazineZhPlugin extends Plugin {
   }
 
   /** New EPUB in Apple Books or Downloads → generate its Chinese table of contents in the background. */
+  /** New EPUB in Apple Books or Downloads → Chinese table of contents, then the whole text, one book at a time.
+   *  Waits out the ChatGPT usage limit; retries other failures on later scans; gives up after repeated failures. */
   async autoScan() {
     if (!this.settings.auto || (this.run && this.run.state.status === 'running')) return;
+    if (Date.now() < (this.settings.pausedUntil || 0)) return;
     const items = await this.loadLibrary(true);
-    const next = autoCandidates(items, this.settings.since, this.settings.tried)[0];
+    const next = autoCandidates(items, this.settings.since, this.settings.records)[0];
     this.refreshPanels();
     if (!next) return;
-    this.settings.tried[next.path] = next.mtime;
+    const rec = this.settings.records[next.path] || { attempts: 0 };
+    rec.attempts += 1;
+    rec.name = displayName(next);
+    this.settings.records[next.path] = rec;
     await this.saveData(this.settings);
-    this.runTool('import', { path: next.path, name: displayName(next) }, ['--model', this.settings.model], { auto: true });
+    const epub = { path: next.path, name: displayName(next) };
+    if (!next.imported) this.runTool('import', epub, ['--model', this.settings.model], { auto: true });
+    else this.runTool('translate', epub, ['--ids', 'all', '--model', this.settings.model], { auto: true, picked: [], total: next.total });
+  }
+
+  /** What an automatic run's outcome means for the next scan. */
+  async afterAutoRun(run, state) {
+    const rec = this.settings.records[run.epubPath] || { attempts: 0 };
+    const text = [...state.messages, ...state.log].join('\n');
+    const failed = Object.values(state.articles).filter(a => a.status === 'failed').length;
+    let next = 5000;
+    if (/用量已到上限/.test(text)) {
+      rec.attempts = Math.max(0, rec.attempts - 1); // not this book's fault
+      this.settings.pausedUntil = resumeTime(text);
+      const at = new Date(this.settings.pausedUntil);
+      new Notice(`ChatGPT 额度用完了，${at.getHours()}:${String(at.getMinutes()).padStart(2, '0')} 后自动接着翻《${run.epub.name}》。`, 10000);
+      next = null;
+    } else if (/登录已失效/.test(text)) {
+      this.settings.pausedUntil = Date.now() + 30 * 60 * 1000;
+      new Notice('ChatGPT 需要重新登录：打开「中文稿工作台」的 ChatGPT 账号面板。', 15000);
+      next = null;
+    } else if (/为保证质量已停止/.test(text) || rec.attempts >= 6) {
+      rec.gaveUp = true;
+      new Notice(`《${run.epub.name}》有内容多次没翻好，已停止自动翻译它；可以在杂志窗口里手动重试。`, 15000);
+    } else if (state.status === 'done' && run.action === 'translate' && !failed) {
+      rec.done = true;
+      new Notice(`📖《${run.epub.name}》已全部翻译完成，可以阅读了。`, 15000);
+    } else if (state.status !== 'done' || failed) {
+      next = 10 * 60 * 1000; // e.g. requests cut off while the Mac slept: fill in what is missing later
+    }
+    this.settings.records[run.epubPath] = rec;
+    await this.saveData(this.settings);
+    window.setTimeout(() => {
+      if (this.run === run) { this.run = null; this.status.hide(); this.refreshPanels(); }
+      if (next !== null) window.setTimeout(() => this.autoScan(), next);
+    }, 5000);
   }
 
   openModal(file) {
@@ -716,6 +780,7 @@ module.exports = class MagazineZhPlugin extends Plugin {
     run.epub = epub;
     run.picked = (options && options.picked) || [];
     run.auto = Boolean(options && options.auto);
+    run.total = (options && options.total) || 0;
     run.listeners.add(state => { if (state.issue) this.issues.set(run.epubPath, state.issue); });
     if (track) {
       this.run = run;
@@ -736,9 +801,9 @@ module.exports = class MagazineZhPlugin extends Plugin {
     if (this.run !== run) return;
     if (state.status === 'running') {
       if (run.action === 'translate') {
-        const ids = run.picked || [];
-        const done = ids.filter(id => state.articles[id] && state.articles[id].status === 'done').length;
-        this.status.setText(`中文稿 · 翻译 ${done}/${ids.length}`);
+        const done = Object.values(state.articles).filter(a => a.status === 'done').length;
+        const total = run.auto ? run.total : (run.picked || []).length;
+        this.status.setText(`中文稿 · ${run.auto ? `自动翻译《${run.epub.name}》` : '翻译'} ${done}/${total || '…'}`);
       } else {
         this.status.setText(`中文稿 · 生成目录：${run.epub.name}`);
       }
@@ -749,26 +814,24 @@ module.exports = class MagazineZhPlugin extends Plugin {
     if (run.announced) return;
     run.announced = true;
     this.libraryAt = 0; // library status changed
+    if (run.auto) {
+      this.status.setText(state.status === 'done' ? '中文稿 · 自动翻译进行中' : '中文稿 · 自动翻译暂停');
+      this.afterAutoRun(run, state);
+      this.refreshPanels();
+      return;
+    }
     if (state.status === 'done') {
       const failed = Object.values(state.articles).filter(a => a.status === 'failed').length;
       if (run.action === 'translate') new Notice(`翻译完成${failed ? `，${failed} 个失败（再翻一次会补上）` : ''}`);
-      else if (run.auto) new Notice(`📰 已为新加入的《${run.epub.name}》生成中文目录。打开「中文稿工作台」或它的目录挑选要翻译的内容。`, 12000);
       else new Notice('中文目录已生成');
       this.status.setText(run.action === 'translate' ? '翻译完成' : '中文目录已生成');
-      if (state.issue && run.action === 'import' && !run.auto) this.openPath(state.issue.index);
+      if (state.issue && run.action === 'import') this.openPath(state.issue.index);
       window.setTimeout(() => { if (this.run === run) this.status.hide(); }, 8000);
     } else if (state.status === 'error') {
       this.status.setText('中文稿处理失败');
-      if (!run.auto) new Notice(`处理失败：${errorText(state)}`, 10000);
+      new Notice(`处理失败：${errorText(state)}`, 10000);
     } else {
       this.status.hide();
-    }
-    if (run.auto) {
-      // Automatic imports hand over to the next new EPUB (if any) instead of staying the "current" job.
-      window.setTimeout(() => {
-        if (this.run === run) { this.run = null; this.status.hide(); }
-        this.autoScan();
-      }, 5000);
     }
     this.refreshPanels();
   }
@@ -791,6 +854,7 @@ module.exports.errorText = errorText;
 module.exports.requestEstimate = requestEstimate;
 module.exports.fileToEpub = fileToEpub;
 module.exports.autoCandidates = autoCandidates;
+module.exports.resumeTime = resumeTime;
 module.exports.Run = Run;
 module.exports.loginStatus = loginStatus;
 module.exports.newestCodex = newestCodex;

@@ -17,21 +17,29 @@ Module._load = function (request, ...rest) {
   }
   return realLoad.call(this, request, ...rest);
 };
-const { applyOutput, errorText, requestEstimate, fileToEpub, autoCandidates, loginStatus, newestCodex, Run } = require('../plugins/liuqing-magazine-zh/main.js');
+const { applyOutput, errorText, requestEstimate, fileToEpub, autoCandidates, resumeTime, loginStatus, newestCodex, Run } = require('../plugins/liuqing-magazine-zh/main.js');
 {
   const now = Date.now() / 1000;
   const items = [
     { path: '/b/old.epub', mtime: now - 10 * 86400, imported: false, drm: false },
-    { path: '/b/done.epub', mtime: now - 3600, imported: true, drm: false },
+    { path: '/b/done.epub', mtime: now - 3600, imported: true, translated: 75, total: 75, drm: false },
+    { path: '/b/half.epub', mtime: now - 7200, imported: true, translated: 10, total: 22, drm: false },
     { path: '/b/drm.epub', mtime: now - 3600, imported: false, drm: true },
-    { path: '/b/tried.epub', mtime: now - 7200, imported: false, drm: false },
+    { path: '/b/gaveup.epub', mtime: now - 5000, imported: false, drm: false },
     { path: '/b/new2.epub', mtime: now - 60, imported: false, drm: false },
     { path: '/b/new1.epub', mtime: now - 600, imported: false, drm: false },
   ];
-  const picked = autoCandidates(items, (now - 3 * 86400) * 1000, { '/b/tried.epub': now - 7200 }).map(x => x.path);
-  assert.deepStrictEqual(picked, ['/b/new1.epub', '/b/new2.epub'], picked);
+  const picked = autoCandidates(items, (now - 3 * 86400) * 1000, { '/b/gaveup.epub': { gaveUp: true } }).map(x => x.path);
+  assert.deepStrictEqual(picked, ['/b/half.epub', '/b/new1.epub', '/b/new2.epub'], picked);
   const lib = applyOutput({ status: 'running', log: [], articles: {}, messages: [] }, '@@ {"event":"books","items":[{"path":"/x.epub"}]}');
   assert.strictEqual(lib.books[0].path, '/x.epub');
+  // reset times: dated, time-only (later today / tomorrow), missing → 5 h
+  const base = new Date(2026, 9, 1, 2, 41).getTime();
+  const fmt = t => { const d = new Date(t); return `${d.getMonth() + 1}-${d.getDate()} ${d.getHours()}:${String(d.getMinutes()).padStart(2, '0')}`; };
+  assert.strictEqual(fmt(resumeTime('ChatGPT 账号的 Codex 用量已到上限，3:57 AM 恢复。', base)), '10-1 4:02');
+  assert.strictEqual(fmt(resumeTime('用量已到上限，Oct 1st, 2026 4:08 AM 恢复。', base)), '10-1 4:13');
+  assert.strictEqual(fmt(resumeTime('用量已到上限，1:10 AM 恢复。', base)), '10-1 7:41'); // tomorrow 1:10 is > 5 h away → 5 h cap
+  assert.strictEqual(fmt(resumeTime('其他错误', base)), '10-1 7:41');
 }
 assert.deepStrictEqual(fileToEpub({ name: 'The Economist 2026-09-26.EPUB', path: '/x/y.epub' }), { path: '/x/y.epub', name: 'The Economist 2026-09-26' });
 
