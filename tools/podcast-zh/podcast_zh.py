@@ -344,41 +344,43 @@ def codex_env():
     return env
 
 
-# Quality first (same policy as Magazine-ZH): 'auto' starts at the best model and steps down this list when a
-# model's quota runs out; the floor is GPT-5.5, below which the run stops. Budget tiers are never used.
-CHAIN = ['gpt-6-astra', 'gpt-6.1-sol', 'gpt-6-sol', 'gpt-5.6-sol', 'gpt-5.5']
-MODELS = {m: 'medium' for m in CHAIN}
+# Quota-saving quality policy (Liuqing, 2026-09-30): everyday translation runs on GPT-5.6-Sol. Only blocks the
+# model is unsure about, or that fail the quality checks, go up this ladder one step at a time for review and
+# correction, up to the best model. 'auto' = that policy; naming a model translates everything with it.
+# Budget tiers (Luna, Terra, Reserve) and anything below GPT-5.5 are never used.
+LADDER = ['gpt-5.6-sol', 'gpt-6-sol', 'gpt-6.1-sol', 'gpt-6-astra']
+MODELS = {m: 'medium' for m in [*LADDER, 'gpt-5.5']}
+_CODEX = None
 
 
-class ModelChain:
+class ModelPolicy:
     def __init__(self):
         self.lock = threading.Lock()
-        self.chain = CHAIN[:]
-        self.index = 0
+        self.ladder = LADDER[:]
+        self.unavailable = set()
         self.used = set()
 
     def start(self, requested):
-        self.chain = CHAIN[:] if requested == 'auto' else [requested]
-        self.index = 0
+        self.ladder = LADDER[:] if requested == 'auto' else [requested]
+
+    def levels(self):
+        """Models still usable in this run, cheapest first."""
+        with self.lock:
+            return [m for m in self.ladder if m not in self.unavailable]
+
+    def drop(self, model, why):
+        with self.lock:
+            if model not in self.unavailable:
+                self.unavailable.add(model)
+                log(f'  {model} {why}，本次不再使用')
 
     @property
-    def current(self):
-        return self.chain[self.index]
-
-    def step_down(self, failed, why):
-        """Move to the next model unless another worker already did; False when nothing acceptable is left."""
-        with self.lock:
-            if self.current != failed:
-                return True
-            if self.index + 1 >= len(self.chain):
-                return False
-            self.index += 1
-            log(f'  {failed} {why}，改用 {self.current} 继续')
-            return True
+    def base(self):
+        levels = self.levels()
+        return levels[0] if levels else None
 
 
-MODEL = ModelChain()
-_CODEX = None
+MODEL = ModelPolicy()
 
 
 def find_codex():
@@ -424,7 +426,10 @@ def codex_failure(raw, model):
     so status codes are matched only in their JSON/HTTP context."""
     low = raw.lower()
     if re.search(r'usage limit|quota exceeded|insufficient quota|out of credits', low):
-        return QuotaError(f'{model} 的额度用完了', 'usage')
+        # Codex usage limits are per ChatGPT account, not per model: switching models does not help.
+        when = re.search(r'try again (?:at|in) ([^.\n]+)', raw)
+        return QuotaError('ChatGPT 账号的 Codex 用量已到上限' + (f'，{when.group(1).strip()} 恢复' if when else '')
+                          + '。已完成的部分已保存，到时再运行会接着做。', 'account')
     if re.search(r'rate limit|too many requests|"status":\s*429|status code:? 429', low):
         return QuotaError(f'{model} 请求太频繁', 'rate')
     if 'model' in low and ('not supported' in low or 'newer version' in low or 'does not exist' in low):
@@ -465,28 +470,39 @@ def run_first_alone(prompt, schema_name, model, timeout):
     return run_codex(prompt, schema_name, model, timeout)
 
 
-def codex(prompt, schema_name, timeout):
-    """One ChatGPT request on the current model of the quality chain; waits out short rate limits and steps
-    down the chain when a model's quota is used up. Stops (QuotaError) when no model ≥ GPT-5.5 is left."""
+class ModelUnavailable(RuntimeError):
+    pass
+
+
+def codex(prompt, schema_name, timeout, model):
+    """One ChatGPT request on `model`; waits out short rate limits. A model the account can't use (or that keeps
+    being rate-limited) raises ModelUnavailable so the caller can use another rung of the ladder."""
     waits = 0
     while True:
-        model = MODEL.current
         try:
             result = run_first_alone(prompt, schema_name, model, timeout)
             MODEL.used.add(model)
             return result
         except QuotaError as exc:
-            if exc.kind == 'login':
-                raise
             if exc.kind == 'rate' and waits < 3:
                 waits += 1
                 time.sleep(30 * waits)
                 continue
-            if MODEL.step_down(model, str(exc).replace(model, '').strip() or '不可用'):
-                waits = 0
-                continue
-            raise QuotaError('为保证翻译质量已停止：GPT-5.5 及以上的模型额度暂时都用完了（或账号用不了）。'
-                             '已完成的部分已保存，额度恢复后再运行会接着做。', 'exhausted') from None
+            if exc.kind in ('model', 'rate'):
+                MODEL.drop(model, str(exc).replace(model, '').strip())
+                raise ModelUnavailable(model) from None
+            raise
+
+
+def ask(prompt, schema_name, timeout, start=0):
+    """Try the ladder from rung `start` upwards; returns (result, model, rung)."""
+    levels = MODEL.levels()
+    for rung in range(start, len(levels)):
+        try:
+            return codex(prompt, schema_name, timeout, levels[rung]), levels[rung], rung
+        except ModelUnavailable:
+            continue
+    raise QuotaError('为保证翻译质量已停止：账号暂时用不了 GPT-5.5 以上的模型。已翻好的都已保存。', 'exhausted')
 
 
 def write_schemas():
@@ -504,7 +520,7 @@ def summarize(ep, paras, model, engine_id):
         transcript = transcript[:140_000] + '\n…\n' + transcript[-60_000:]
     payload = {'show': ep['show'], 'title': ep['title'], 'description': re.sub(r'<[^>]+>', ' ', ep['description'])[:3000],
                'transcript': transcript}
-    result = codex(SUMMARY_PROMPT + json.dumps(payload, ensure_ascii=False), 'summary', 300)
+    result = ask(SUMMARY_PROMPT + json.dumps(payload, ensure_ascii=False), 'summary', 300)[0]
     cache.write_text(json.dumps(result, ensure_ascii=False), encoding='utf-8')
     return result
 
@@ -534,17 +550,23 @@ def translate_group(indexes, paras, glossary, model, depth=0):
     items = [{'id': i, 'en': paras[i]['en']} for i in indexes]
     # The whole glossary (≤40 terms) goes with every batch: ASR misspellings often escape substring matching.
     payload = json.dumps({'previous': previous, 'glossary': glossary, 'items': items}, ensure_ascii=False)
-    for attempt in range(2):
+    # Cheapest rung first; a batch that fails the checks is retried one rung higher, up to the best model.
+    rung = 0
+    for attempt in range(len(MODEL.levels()) + 1):
         try:
-            result = codex(TRANSLATE_PROMPT + payload, 'batch', 240)
+            result, model_used, rung = ask(TRANSLATE_PROMPT + payload, 'batch', 240, rung)
             got = {int(x['id']): {'zh': x['zh'].strip(), 'ad': bool(x['ad'])} for x in result.get('items', [])}
             if set(got) == set(indexes) and all(has_chinese(got[i]['zh']) or len(paras[i]['en']) < 25 for i in indexes):
                 return got
         except QuotaError:
             raise
         except Exception as exc:  # noqa: BLE001 - retried below, reported if it keeps failing
-            if attempt:
-                log(f'  （一组翻译失败：{str(exc)[:120]}）')
+            log(f'  （一组翻译失败：{str(exc)[:120]}）')
+            continue
+        if rung + 1 >= len(MODEL.levels()):
+            break
+        rung += 1
+        log(f'  一组译文没通过检查，改用 {MODEL.levels()[rung]} 重翻')
     if len(indexes) > 1 and depth < 3:
         half = len(indexes) // 2
         return {**translate_group(indexes[:half], paras, glossary, model, depth + 1),
@@ -591,7 +613,7 @@ def write_note(ep, paras, zh, summary, model, duration, engine):
     lines = ['---', f'title: {q(title_zh)}', f'original_title: {q(ep["title"])}', f'show: {q(ep["show"])}',
              f'published: {ep["published"]}', f'duration: {q(fmt_time(duration))}', f'source: {q(ep["page"])}',
              f'audio: {q(ep["audio"] if str(ep["audio"]).startswith("http") else "")}',
-             f'created: {dt.date.today().isoformat()}', f'translator: {q("ChatGPT " + " / ".join(m for m in CHAIN if m in MODEL.used) + " · " + engine)}',
+             f'created: {dt.date.today().isoformat()}', f'translator: {q("ChatGPT " + " / ".join(m for m in LADDER if m in MODEL.used) + " · " + engine)}',
              'tags:', '  - 播客', '  - 中文稿', '---', '',
              f'# {title_zh}', '', f'> {ep["show"]} · {ep["published"]} · {fmt_time(duration)}',
              f'> 原标题：{ep["title"]}', '']
@@ -629,14 +651,14 @@ def write_note(ep, paras, zh, summary, model, duration, engine):
 def main():
     parser = argparse.ArgumentParser(description='Apple 播客单集 → Obsidian 中文稿')
     parser.add_argument('source', help='Apple 播客单集链接、音频链接或本机音频文件')
-    parser.add_argument('--model', default='auto', help='auto（最好的模型起，额度用完依次降级，最低 GPT-5.5）或指定模型')
+    parser.add_argument('--model', default='auto', help='auto（日常 GPT-5.6-Sol，不合格的段落逐级升级）或指定一个模型全程使用')
     parser.add_argument('--jobs', type=int, default=3, help='同时翻译的组数')
     parser.add_argument('--engine', default='apple', choices=['apple', 'whisper'], help='英文语音识别引擎')
     parser.add_argument('--beam', type=int, default=5)
     parser.add_argument('--threads', type=int, default=8)
     parser.add_argument('--open', action='store_true', help='完成后在 Obsidian 打开')
     args = parser.parse_args()
-    if args.model not in ('auto', *CHAIN):
+    if args.model not in ('auto', *MODELS):
         args.model = 'auto'  # older settings (e.g. a budget model) fall back to the quality chain
     MODEL.start(args.model)
 
@@ -671,7 +693,7 @@ def main():
         log('④ 生成要点和术语表（ChatGPT）…')
         summary = summarize(ep, paras, args.model, data.get('engine_id', 'whisper'))
         glossary = [t for t in summary.get('terms', []) if t.get('en') and t.get('zh')]
-        log(f'⑤ 翻译全文（ChatGPT {MODEL.current} 起，最低 GPT-5.5）…')
+        log(f'⑤ 翻译全文（日常用 {MODEL.base}，不合格的再逐级升级）…')
         zh = translate(ep, paras, glossary, args.model, max(1, args.jobs))
     except QuotaError as exc:
         raise SystemExit(str(exc)) from None

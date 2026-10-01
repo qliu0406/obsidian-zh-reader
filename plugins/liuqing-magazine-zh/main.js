@@ -151,9 +151,9 @@ function renderAccount(el, plugin, cls) {
 
 
 const MODELS = {
-  auto: '最好质量 · 自动（Astra 起，额度用完依次换次好的，最低 GPT-5.5，再不够就停）',
-  'gpt-6-astra': '只用 GPT-6-Astra（最强）',
-  'gpt-6.1-sol': '只用 GPT-6.1-Sol（最新主力）',
+  auto: '日常 · 省额度（GPT-5.6-Sol；数据/金融文章高一级；没把握的段落逐级升级到最好的模型校对）',
+  'gpt-6.1-sol': '全程 GPT-6.1-Sol',
+  'gpt-6-astra': '全程 GPT-6-Astra（最费额度）',
 };
 const DEFAULT_MODEL = 'auto';
 const AUTO_EVERY_MS = 10 * 60 * 1000;

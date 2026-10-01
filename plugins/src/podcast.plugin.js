@@ -6,9 +6,9 @@ const { Plugin, Modal, Notice, Setting, FileSystemAdapter, TFile, MarkdownRender
 const WORKBENCH = '中文稿工作台.md';
 
 const MODELS = {
-  auto: '最好质量 · 自动（Astra 起，额度用完依次换次好的，最低 GPT-5.5，再不够就停）',
-  'gpt-6-astra': '只用 GPT-6-Astra（最强）',
-  'gpt-6.1-sol': '只用 GPT-6.1-Sol（最新主力）',
+  auto: '日常 · 省额度（GPT-5.6-Sol；不合格的段落逐级升级到最好的模型）',
+  'gpt-6.1-sol': '全程 GPT-6.1-Sol',
+  'gpt-6-astra': '全程 GPT-6-Astra（最费额度）',
 };
 const DEFAULT_MODEL = 'auto';
 const STEP = /^[①②③④⑤✅]/;
