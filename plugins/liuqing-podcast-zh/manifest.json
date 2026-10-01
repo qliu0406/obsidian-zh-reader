@@ -1,0 +1,9 @@
+{
+  "id": "liuqing-podcast-zh",
+  "name": "Liuqing Podcast 中文稿",
+  "version": "0.1.0",
+  "minAppVersion": "1.5.0",
+  "description": "Paste an Apple Podcasts episode link and get a Chinese transcript note (Apple on-device speech + your ChatGPT), using the local Podcast-ZH tool.",
+  "author": "Liuqing",
+  "isDesktopOnly": true
+}

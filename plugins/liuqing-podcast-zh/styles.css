@@ -1,0 +1,116 @@
+.lpz-panel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--size-4-3);
+  padding: var(--size-4-5);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-l);
+  background: var(--background-secondary);
+}
+
+.lpz-panel .lpz-panel-head {
+  display: flex;
+  align-items: center;
+  gap: var(--size-4-2);
+  font-size: var(--font-ui-large);
+  font-weight: var(--font-semibold);
+  color: var(--text-normal);
+}
+
+.lpz-panel .lpz-panel-icon {
+  display: flex;
+  color: var(--text-muted);
+}
+
+.lpz-panel .lpz-panel-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--size-4-2);
+}
+
+.lpz-panel .lpz-panel-input {
+  flex: 1;
+  min-width: 16em;
+  height: var(--input-height);
+}
+
+.lpz-panel .lpz-panel-line {
+  color: var(--text-normal);
+}
+
+.lpz-panel .lpz-step-detail {
+  color: var(--text-muted);
+  font-size: var(--font-ui-small);
+}
+
+.lpz-panel .lpz-error {
+  color: var(--text-error);
+}
+
+.lpz-modal .lpz-input {
+  width: 100%;
+  min-width: 18em;
+}
+
+.lpz-modal .lpz-steps {
+  display: flex;
+  flex-direction: column;
+  gap: var(--size-4-3);
+  padding: var(--size-4-2) 0;
+}
+
+.lpz-modal .lpz-step-title {
+  color: var(--text-normal);
+}
+
+.lpz-modal .lpz-step-detail {
+  color: var(--text-muted);
+  font-size: var(--font-ui-small);
+  padding-top: var(--size-2-1);
+  word-break: break-word;
+}
+
+.lpz-modal .lpz-error {
+  color: var(--text-error);
+  padding: var(--size-4-2) 0;
+  word-break: break-word;
+}
+
+.lpz-modal .lpz-muted {
+  color: var(--text-muted);
+  font-size: var(--font-ui-small);
+  padding-top: var(--size-4-2);
+}
+
+.lpz-account {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--size-4-2);
+  color: var(--text-muted);
+  font-size: var(--font-ui-small);
+}
+
+.lpz-modal .lpz-account {
+  margin-top: var(--size-4-3);
+  padding-top: var(--size-4-3);
+  border-top: 1px solid var(--background-modifier-border);
+}
+
+.lpz-account-panel .lpz-account {
+  font-size: var(--font-ui-medium);
+  color: var(--text-normal);
+}
+
+.lpz-account .lpz-account-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--size-4-2);
+}
+
+.lpz-account .lpz-account-error {
+  width: 100%;
+  color: var(--text-error);
+}

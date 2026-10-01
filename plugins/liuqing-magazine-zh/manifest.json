@@ -1,0 +1,9 @@
+{
+  "id": "liuqing-magazine-zh",
+  "name": "Liuqing Magazine 中文稿",
+  "version": "0.1.0",
+  "minAppVersion": "1.5.0",
+  "description": "Turn a magazine EPUB into a Chinese table of contents, then translate the articles you pick into notes (uses your ChatGPT via the local Magazine-ZH tool).",
+  "author": "Liuqing",
+  "isDesktopOnly": true
+}

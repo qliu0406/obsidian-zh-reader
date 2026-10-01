@@ -1,0 +1,649 @@
+// Liuqing Magazine 中文稿: magazines and books (EPUB) from Apple Books, Downloads or anywhere → Chinese table of
+// contents → pick articles/chapters → Chinese notes. The local Magazine-ZH tool does the work; this plugin shows
+// the library, starts the tool, follows its progress, and auto-generates the Chinese TOC for newly added EPUBs.
+const { Plugin, Modal, Notice, Setting, FileSystemAdapter, TFile, MarkdownRenderChild, setIcon } = require('obsidian');
+
+const MODELS = {
+  auto: '最好质量 · 自动（Astra 起，额度用完依次换次好的，最低 GPT-5.5，再不够就停）',
+  'gpt-6-astra': '只用 GPT-6-Astra（最强）',
+  'gpt-6.1-sol': '只用 GPT-6.1-Sol（最新主力）',
+};
+const DEFAULT_MODEL = 'auto';
+const AUTO_EVERY_MS = 10 * 60 * 1000;
+const FIRST_RUN_LOOKBACK_MS = 0; // only EPUBs added after the plugin is first enabled
+
+function paths() {
+  const path = require('path');
+  const home = require('os').homedir();
+  return {
+    tool: path.join(home, 'Applications/Magazine-ZH'),
+    python: path.join(home, 'Applications/Fed-English-Translator/.runtime/python/bin/python3'),
+  };
+}
+
+/** Rough number of ChatGPT requests for translating these articles (one per ~900 words). */
+function requestEstimate(articles) {
+  return articles.reduce((n, a) => n + Math.max(1, Math.ceil((a.words || 0) / 900)), 0);
+}
+
+/** Fold one stdout line of the tool into the run state (pure; covered by tests). */
+function applyOutput(state, raw) {
+  const line = raw.replace(/\s+$/, '');
+  if (!line.trim()) return state;
+  if (line.startsWith('@@ ')) {
+    let ev;
+    try { ev = JSON.parse(line.slice(3)); } catch (e) { return state; }
+    const articles = { ...state.articles };
+    if (ev.event === 'issue') return { ...state, issue: ev.issue };
+    if (ev.event === 'books') return { ...state, books: ev.items };
+    if (ev.event === 'article_start') articles[ev.id] = { status: 'running' };
+    if (ev.event === 'article_done') articles[ev.id] = { status: 'done', note: ev.note };
+    if (ev.event === 'article_failed') articles[ev.id] = { status: 'failed', error: ev.error };
+    return { ...state, articles };
+  }
+  return { ...state, log: [...state.log, line.trim().replace(/^·\s*/, '')].slice(-6) };
+}
+
+/** Library items worth auto-importing: new since `since`, not imported, readable, not tried at this version. */
+function autoCandidates(items, since, tried) {
+  return items.filter(x => !x.imported && !x.drm && x.mtime * 1000 > since && tried[x.path] !== x.mtime)
+    .sort((a, b) => a.mtime - b.mtime);
+}
+
+function displayName(item) {
+  return [item.name, item.date].filter(Boolean).join(' ');
+}
+
+/** A dropped/chosen File → { path, name }. Electron ≥ 32 removed File.path; webUtils replaces it. */
+function fileToEpub(file) {
+  let path = '';
+  try { path = require('electron').webUtils.getPathForFile(file); } catch (e) { /* older Electron */ }
+  path = path || file.path || '';
+  return { path, name: file.name.replace(/\.epub$/i, '') };
+}
+
+/** Drop zone + file chooser for EPUBs that are not in Apple Books or Downloads. */
+function renderDropZone(el, onEpub) {
+  const drop = el.createDiv({ cls: 'lmz-drop' });
+  drop.createDiv({ cls: 'lmz-drop-title', text: '或者把 EPUB 拖到这里' });
+  const picker = drop.createEl('input', { type: 'file', attr: { accept: '.epub,application/epub+zip' } });
+  picker.addClass('lmz-hidden');
+  drop.createEl('button', { text: '选择文件…' }).addEventListener('click', () => picker.click());
+  picker.addEventListener('change', () => { if (picker.files[0]) onEpub(fileToEpub(picker.files[0])); picker.value = ''; });
+  drop.addEventListener('dragover', e => { e.preventDefault(); drop.addClass('is-over'); });
+  drop.addEventListener('dragleave', () => drop.removeClass('is-over'));
+  drop.addEventListener('drop', e => {
+    e.preventDefault();
+    drop.removeClass('is-over');
+    const file = e.dataTransfer && e.dataTransfer.files[0];
+    if (file) onEpub(fileToEpub(file));
+  });
+  return drop;
+}
+
+/** Apple Books + Downloads library with a search box; `limit` shortens the list (panel view). */
+function renderLibrary(el, plugin, onPick, limit) {
+  const wrap = el.createDiv({ cls: 'lmz-library' });
+  const head = wrap.createDiv({ cls: 'lmz-library-head' });
+  head.createSpan({ cls: 'lmz-subheading', text: '📚 Apple 图书和「下载」里的 EPUB' });
+  const search = head.createEl('input', { type: 'search', cls: 'lmz-search', attr: { placeholder: '搜索书名或杂志名' } });
+  const list = wrap.createDiv({ cls: 'lmz-list' });
+  const draw = () => {
+    list.empty();
+    const items = plugin.library;
+    if (!items) { list.createDiv({ cls: 'lmz-muted', text: '正在读取你的图书…' }); return; }
+    if (!items.length) { list.createDiv({ cls: 'lmz-muted', text: 'Apple 图书（iCloud）和「下载」里还没有 EPUB。用隔空投送或「图书」添加后，这里会自动出现。' }); return; }
+    const q = search.value.trim().toLowerCase();
+    let shown = items.filter(x => !q || `${x.name} ${x.author} ${x.date}`.toLowerCase().includes(q));
+    const more = limit && !q && shown.length > limit;
+    if (more) shown = shown.slice(0, limit);
+    for (const item of shown) {
+      const row = list.createEl('button', { cls: 'lmz-book' });
+      row.createSpan({ cls: `lmz-badge lmz-badge-${item.kind}`, text: item.kind === 'book' ? '书' : '杂志' });
+      const text = row.createDiv({ cls: 'lmz-item-text' });
+      text.createDiv({ cls: 'lmz-item-title', text: displayName(item) });
+      const unit = item.kind === 'book' ? '章' : '篇';
+      const state = item.drm ? '受版权保护，无法翻译'
+        : item.imported ? `中文目录已生成${item.translated ? ` · 已翻译 ${item.translated} ${unit}` : ''}` : '新';
+      text.createDiv({ cls: 'lmz-item-meta', text: [item.author, item.source, state].filter(Boolean).join(' · ') });
+      if (item.drm) row.setAttr('disabled', 'true');
+      else row.addEventListener('click', () => onPick({ path: item.path, name: displayName(item) }));
+    }
+    if (more) list.createDiv({ cls: 'lmz-muted', text: `还有 ${items.length - limit} 本，搜索或点「全部图书」查看。` });
+  };
+  search.addEventListener('input', draw);
+  draw();
+  plugin.loadLibrary().then(draw);
+  return wrap;
+}
+
+function errorText(state) {
+  const lines = state.messages.filter(l => !/^(Traceback|File "|\^+$|~+$)/.test(l));
+  return lines[lines.length - 1] || '处理失败，请稍后再试。';
+}
+
+class Run {
+  constructor(action, epubPath, extra) {
+    this.action = action;
+    this.epubPath = epubPath;
+    this.extra = extra || [];
+    this.state = { status: 'running', log: [], issue: null, books: null, articles: {}, messages: [] };
+    this.listeners = new Set();
+    this.child = null;
+  }
+
+  set(state) {
+    this.state = state;
+    for (const listener of this.listeners) listener(this.state);
+  }
+
+  start(vaultPath) {
+    const { spawn } = require('child_process');
+    const fs = require('fs');
+    const p = paths();
+    if (!fs.existsSync(p.python) || !fs.existsSync(require('path').join(p.tool, 'magazine_zh.py'))) {
+      this.set({ ...this.state, status: 'error', messages: ['找不到本机工具：需要 ~/Applications/Magazine-ZH 和 ~/Applications/Fed-English-Translator。'] });
+      return;
+    }
+    const args = ['-B', '-E', '-s', '-X', 'utf8', 'magazine_zh.py', this.action, ...(this.epubPath ? [this.epubPath] : []), ...this.extra];
+    // detached: cancelling kills the tool and the ChatGPT processes it started.
+    this.child = spawn(p.python, args, { cwd: p.tool, env: { ...process.env, MZH_VAULT: vaultPath }, detached: true });
+    let buffer = '';
+    this.child.stdout.setEncoding('utf8');
+    this.child.stdout.on('data', chunk => {
+      buffer += chunk;
+      const lines = buffer.split('\n');
+      buffer = lines.pop();
+      let next = this.state;
+      for (const line of lines) next = applyOutput(next, line);
+      this.set(next);
+    });
+    this.child.stderr.setEncoding('utf8');
+    this.child.stderr.on('data', chunk => {
+      const lines = chunk.split(/[\r\n]+/).map(l => l.trim()).filter(Boolean);
+      if (lines.length) this.set({ ...this.state, messages: [...this.state.messages, ...lines].slice(-20) });
+    });
+    this.child.on('error', err => this.set({ ...this.state, status: 'error', messages: [...this.state.messages, `无法启动：${err.message}`] }));
+    this.child.on('close', code => {
+      const next = buffer ? applyOutput(this.state, buffer) : this.state;
+      buffer = '';
+      this.child = null;
+      if (this.state.status === 'cancelled') return;
+      this.set({ ...next, status: code === 0 ? 'done' : 'error' });
+    });
+  }
+
+  cancel() {
+    if (this.state.status !== 'running') return;
+    this.set({ ...this.state, status: 'cancelled' });
+    if (this.child) {
+      try { process.kill(-this.child.pid, 'SIGTERM'); } catch (e) { try { this.child.kill('SIGTERM'); } catch (e2) { /* gone */ } }
+      this.child = null;
+    }
+  }
+}
+
+class MagazineModal extends Modal {
+  constructor(app, plugin, file) {
+    super(app);
+    this.plugin = plugin;
+    this.epub = file || null; // { path: absolute path, name }
+    this.issue = null;
+    this.selected = new Set();
+    this.unsubscribe = null;
+  }
+
+  onOpen() {
+    this.modalEl.addClass('lmz-modal');
+    this.titleEl.setText('杂志 / 书 → 中文稿');
+    this.plugin.modals.add(this);
+    const run = this.plugin.run;
+    if (run && (run.state.status === 'running' || run.action === 'translate') && !(this.epub && this.epub.path !== run.epubPath)) {
+      this.epub = run.epub;
+      this.issue = run.state.issue || this.plugin.issues.get(run.epubPath) || null;
+      return this.follow(run);
+    }
+    if (this.epub) return this.open(this.epub);
+    this.renderPick();
+  }
+
+  open(epub) {
+    if (!/\.epub\/?$/i.test(epub.path || '')) {
+      new Notice('请选择 .epub 格式的文件。');
+      return;
+    }
+    this.epub = epub;
+    this.loadIssue();
+  }
+
+  onClose() {
+    this.plugin.modals.delete(this);
+    this.detach();
+    this.contentEl.empty();
+  }
+
+  detach() {
+    if (this.unsubscribe) this.unsubscribe();
+    this.unsubscribe = null;
+  }
+
+  follow(run) {
+    this.detach();
+    const listener = () => this.renderRun(run);
+    run.listeners.add(listener);
+    this.unsubscribe = () => run.listeners.delete(listener);
+    this.renderRun(run);
+  }
+
+  /** Re-render only the screens that show the account line or library (not a picker with ticked boxes). */
+  refreshLight() {
+    if (this.screen === 'pick') this.renderPick();
+  }
+
+  renderPick() {
+    this.detach();
+    this.screen = 'pick';
+    const el = this.contentEl;
+    el.empty();
+    renderLibrary(el, this.plugin, epub => this.open(epub));
+    renderDropZone(el, epub => this.open(epub));
+    renderAccount(el, this.plugin, 'lmz-account');
+  }
+
+  /** Ask the tool what it already knows about this EPUB (no network), then show the picker or the import step. */
+  loadIssue() {
+    this.screen = 'load';
+    const el = this.contentEl;
+    el.empty();
+    el.createDiv({ cls: 'lmz-muted', text: '正在读取…' });
+    const run = this.plugin.runTool('status', this.epub, [], { track: false });
+    const settle = state => {
+      if (state.status === 'running' || run.settled) return;
+      run.settled = true;
+      if (state.status === 'error') return this.renderError(errorText(state));
+      this.issue = state.issue;
+      if (this.issue) this.renderPicker();
+      else this.renderImport();
+    };
+    run.listeners.add(settle);
+    settle(run.state); // it may already have failed synchronously
+  }
+
+  busy() {
+    if (this.plugin.run && this.plugin.run.state.status === 'running') {
+      new Notice('正在处理另一本，请等它完成（或在状态栏打开后取消）。');
+      return true;
+    }
+    return false;
+  }
+
+  renderImport() {
+    this.detach();
+    this.screen = 'import';
+    const el = this.contentEl;
+    el.empty();
+    el.createDiv({ cls: 'lmz-heading', text: this.epub.name });
+    el.createDiv({ cls: 'lmz-muted', text: '第一步：生成中文目录（每篇文章或每一章的中文标题和一句话简介），只用一到三次 ChatGPT 请求。' });
+    new Setting(el).addButton(b => b.setButtonText('换一本').onClick(() => this.renderPick()))
+      .addButton(b => b.setButtonText('生成中文目录').setCta().onClick(() => {
+        if (this.busy()) return;
+        const run = this.plugin.runTool('import', this.epub, ['--model', this.plugin.settings.model]);
+        this.follow(run);
+      }));
+  }
+
+  renderPicker() {
+    this.detach();
+    this.screen = 'picker';
+    const el = this.contentEl;
+    el.empty();
+    const issue = this.issue;
+    const unit = issue.kind === 'book' ? '章' : '篇';
+    el.createDiv({ cls: 'lmz-heading', text: `${issue.magazine} ${issue.issue}`.trim() });
+    const top = new Setting(el).setName(`共 ${issue.articles.length} ${unit}`).setDesc(`勾选要翻译的${unit === '章' ? '章节' : '文章'}，已翻译的可以直接打开。`);
+    top.addButton(b => b.setButtonText('换一本').onClick(() => this.renderPick()));
+    top.addButton(b => b.setButtonText('打开中文目录').onClick(() => { this.plugin.openPath(issue.index); this.close(); }));
+
+    const list = el.createDiv({ cls: 'lmz-list' });
+    const footer = el.createDiv({ cls: 'lmz-footer' });
+    const summary = footer.createDiv({ cls: 'lmz-muted' });
+    const boxes = new Map();
+    const sectionBoxes = new Map();
+    let translate;
+    const refresh = () => {
+      const picked = issue.articles.filter(a => this.selected.has(a.id));
+      summary.setText(picked.length ? `已选 ${picked.length} ${unit} · 约 ${requestEstimate(picked)} 次 ChatGPT 请求` : `还没有选择${unit === '章' ? '章节' : '文章'}`);
+      if (translate) translate.setDisabled(!picked.length);
+      for (const [section, box] of sectionBoxes) {
+        const ids = issue.articles.filter(a => (a.section || '') === section).map(a => a.id);
+        const n = ids.filter(id => this.selected.has(id)).length;
+        box.checked = n === ids.length;
+        box.indeterminate = n > 0 && n < ids.length;
+      }
+    };
+    let current = null;
+    for (const a of issue.articles) {
+      const section = a.section || '';
+      if (section !== current) {
+        current = section;
+        const head = list.createEl('label', { cls: 'lmz-section' });
+        const box = head.createEl('input', { type: 'checkbox' });
+        head.createSpan({ text: [a.section_zh, section].filter(Boolean).join(' · ') || (unit === '章' ? '章节' : '文章') });
+        sectionBoxes.set(section, box);
+        box.addEventListener('change', () => {
+          for (const b of issue.articles.filter(x => (x.section || '') === section)) {
+            if (box.checked) this.selected.add(b.id); else this.selected.delete(b.id);
+            boxes.get(b.id).checked = box.checked;
+          }
+          refresh();
+        });
+      }
+      const row = list.createDiv({ cls: 'lmz-row' });
+      const label = row.createEl('label', { cls: 'lmz-item' });
+      const box = label.createEl('input', { type: 'checkbox' });
+      box.checked = this.selected.has(a.id);
+      boxes.set(a.id, box);
+      const text = label.createDiv({ cls: 'lmz-item-text' });
+      text.createDiv({ cls: 'lmz-item-title', text: a.title_zh || a.title });
+      text.createDiv({ cls: 'lmz-item-meta', text: `${a.title} · ${a.words} 词` });
+      box.addEventListener('change', () => { if (box.checked) this.selected.add(a.id); else this.selected.delete(a.id); refresh(); });
+      if (a.note) {
+        const open = row.createEl('button', { cls: 'lmz-open', text: '已翻译 · 打开' });
+        open.addEventListener('click', () => { this.plugin.openPath(a.note); this.close(); });
+      }
+    }
+    const actions = new Setting(footer);
+    actions.addDropdown(dd => {
+      for (const [id, label] of Object.entries(MODELS)) dd.addOption(id, label);
+      dd.setValue(this.plugin.settings.model).onChange(v => { this.plugin.settings.model = v; this.plugin.saveData(this.plugin.settings); });
+    });
+    actions.addButton(b => {
+      translate = b;
+      b.setButtonText('翻译选中').setCta().onClick(() => {
+        const ids = [...this.selected].sort((x, y) => x - y);
+        if (!ids.length || this.busy()) return;
+        const run = this.plugin.runTool('translate', this.epub, ['--ids', ids.join(','), '--model', this.plugin.settings.model], { picked: ids });
+        this.selected.clear();
+        this.follow(run);
+      });
+    });
+    refresh();
+  }
+
+  renderRun(run) {
+    this.screen = 'run';
+    const el = this.contentEl;
+    el.empty();
+    const { status, log, articles } = run.state;
+    if (run.state.issue) this.issue = run.state.issue;
+    const unit = this.issue && this.issue.kind === 'book' ? '章' : '篇';
+    const titles = new Map((this.issue ? this.issue.articles : []).map(a => [a.id, a.title_zh || a.title]));
+    if (run.action === 'translate') {
+      const ids = run.picked || [];
+      const done = ids.filter(id => articles[id] && articles[id].status === 'done').length;
+      el.createDiv({ cls: 'lmz-heading', text: `翻译 ${ids.length} ${unit} · 已完成 ${done}` });
+      const list = el.createDiv({ cls: 'lmz-list' });
+      for (const id of ids) {
+        const s = articles[id] ? articles[id].status : 'waiting';
+        const row = list.createDiv({ cls: 'lmz-progress-row' });
+        row.createDiv({ cls: 'lmz-item-title', text: titles.get(id) || `第 ${id} ${unit}` });
+        row.createDiv({ cls: `lmz-state lmz-state-${s}`, text: { waiting: '等待', running: '翻译中', done: '完成', failed: '失败' }[s] });
+      }
+    } else {
+      el.createDiv({ cls: 'lmz-heading', text: run.epub ? run.epub.name : '' });
+      const list = el.createDiv({ cls: 'lmz-list' });
+      for (const line of log) list.createDiv({ cls: 'lmz-log', text: line });
+      if (!log.length && status === 'running') list.createDiv({ cls: 'lmz-log', text: '正在启动…' });
+    }
+    if (status === 'error') {
+      el.createDiv({ cls: 'lmz-error', text: errorText(run.state) });
+      if (/登录/.test(errorText(run.state))) renderAccount(el, this.plugin, 'lmz-account');
+    }
+    if (status === 'cancelled') el.createDiv({ cls: 'lmz-muted', text: '已取消。已完成的部分已保存。' });
+    const actions = new Setting(el);
+    if (status === 'running') {
+      el.createDiv({ cls: 'lmz-muted', text: '可以关掉这个窗口，会在后台继续；底部状态栏显示进度。' });
+      actions.addButton(b => b.setButtonText('取消').onClick(() => run.cancel()));
+      actions.addButton(b => b.setButtonText('返回书库').onClick(() => this.renderPick()));
+      actions.addButton(b => b.setButtonText('后台运行').setCta().onClick(() => this.close()));
+      return;
+    }
+    if (this.issue) {
+      actions.addButton(b => b.setButtonText('打开中文目录').onClick(() => { this.plugin.openPath(this.issue.index); this.close(); }));
+      actions.addButton(b => b.setButtonText(run.action === 'translate' ? '继续挑选' : `挑选要翻译的${unit === '章' ? '章节' : '文章'}`).setCta().onClick(() => {
+        this.plugin.clearRun();
+        this.renderPicker();
+      }));
+    } else {
+      actions.addButton(b => b.setButtonText('返回').onClick(() => { this.plugin.clearRun(); this.renderPick(); }));
+    }
+  }
+
+  renderError(message) {
+    this.screen = 'error';
+    const el = this.contentEl;
+    el.empty();
+    el.createDiv({ cls: 'lmz-error', text: message });
+    new Setting(el).addButton(b => b.setButtonText('返回').onClick(() => this.renderPick()));
+  }
+}
+
+/** The ```magazine-zh``` block in a note: the newest EPUBs from Apple Books/Downloads, a drop zone, and progress. */
+class MagazinePanel extends MarkdownRenderChild {
+  constructor(el, plugin) {
+    super(el);
+    this.plugin = plugin;
+  }
+
+  onload() {
+    this.plugin.panels.add(this);
+    this.render();
+  }
+
+  onunload() {
+    this.plugin.panels.delete(this);
+  }
+
+  render() {
+    const el = this.containerEl;
+    el.empty();
+    el.addClass('lmz-panel', 'lmz-modal');
+    const head = el.createDiv({ cls: 'lmz-panel-head' });
+    setIcon(head.createSpan({ cls: 'lmz-panel-icon' }), 'newspaper');
+    head.createSpan({ text: '杂志 / 书（EPUB）→ 中文稿' });
+    const run = this.plugin.run;
+    if (run && run.state.status === 'running') {
+      const ids = run.picked || [];
+      const done = ids.filter(id => run.state.articles[id] && run.state.articles[id].status === 'done').length;
+      const line = el.createDiv({ cls: 'lmz-panel-line' });
+      line.setText(run.action === 'translate' ? `《${run.epub.name}》正在翻译 ${done}/${ids.length}` : `《${run.epub.name}》正在生成中文目录${run.auto ? '（自动）' : ''}`);
+      el.createEl('button', { text: '查看进度' }).addEventListener('click', () => this.plugin.openModal());
+    }
+    renderLibrary(el, this.plugin, epub => this.plugin.openModal(epub), 6);
+    const row = el.createDiv({ cls: 'lmz-panel-row' });
+    row.createEl('button', { text: '全部图书 / 选择其他文件…' }).addEventListener('click', () => this.plugin.openModal());
+    const auto = row.createEl('label', { cls: 'lmz-auto' });
+    const box = auto.createEl('input', { type: 'checkbox' });
+    box.checked = this.plugin.settings.auto;
+    auto.createSpan({ text: '新加入的 EPUB 自动生成中文目录' });
+    box.addEventListener('change', () => { this.plugin.settings.auto = box.checked; this.plugin.saveData(this.plugin.settings); });
+  }
+}
+
+module.exports = class MagazineZhPlugin extends Plugin {
+  async onload() {
+    this.settings = Object.assign({ model: DEFAULT_MODEL, auto: true, since: 0, tried: {} }, await this.loadData());
+    if (!MODELS[this.settings.model]) this.settings.model = DEFAULT_MODEL;
+    if (!this.settings.since) {
+      // First run: start watching from now on; nothing already in the library is processed automatically.
+      this.settings.since = Date.now() - FIRST_RUN_LOOKBACK_MS;
+      await this.saveData(this.settings);
+    }
+    this.run = null;
+    this.issues = new Map();
+    this.library = null;
+    this.panels = new Set();
+    this.modals = new Set();
+    this.status = this.addStatusBarItem();
+    this.status.addClass('lmz-status', 'mod-clickable');
+    this.status.hide();
+    this.registerDomEvent(this.status, 'click', () => this.openModal());
+    this.addRibbonIcon('newspaper', '杂志 / 书转中文稿', () => this.openModal());
+    this.addCommand({ id: 'translate-magazine', name: '把杂志或书（EPUB）转成中文稿', callback: () => this.openModal() });
+    this.addCommand({ id: 'login-chatgpt', name: '登录 ChatGPT（中文稿翻译用）', callback: () => this.startLogin() });
+    this.registerMarkdownCodeBlockProcessor('magazine-zh', (source, el, ctx) => ctx.addChild(new MagazinePanel(el, this)));
+    this.registerEvent(this.app.workspace.on('file-menu', (menu, file) => {
+      if (!(file instanceof TFile) || file.extension !== 'epub') return;
+      menu.addItem(item => item.setTitle('翻译这本杂志 / 书（中文稿）').setIcon('newspaper')
+        .onClick(() => this.openModal({ path: require('path').join(this.vaultPath(), file.path), name: file.basename })));
+    }));
+    this.app.workspace.onLayoutReady(() => {
+      this.registerInterval(window.setInterval(() => this.autoScan(), AUTO_EVERY_MS));
+      window.setTimeout(() => this.autoScan(), 15000);
+    });
+  }
+
+  onunload() {
+    if (this.run) this.run.cancel();
+    if (this.loginFlow) this.loginFlow.cancel();
+  }
+
+  startLogin() {
+    if (this.loginFlow && this.loginFlow.state.phase === 'waiting') return;
+    this.loginFlow = new LoginFlow(state => {
+      if (state.phase === 'done') new Notice('ChatGPT 已登录，可以继续翻译了。');
+      this.refreshPanels();
+      for (const modal of this.modals) modal.refreshLight();
+    });
+    this.loginFlow.start();
+  }
+
+  refreshPanels() {
+    for (const panel of this.panels) panel.render();
+  }
+
+  /** List Apple Books (iCloud) + Downloads EPUBs via the tool; cached briefly so panels redraw cheaply. */
+  loadLibrary(force) {
+    if (!force && this.libraryAt && Date.now() - this.libraryAt < 60000) return Promise.resolve(this.library);
+    if (this.libraryLoading) return this.libraryLoading;
+    this.libraryLoading = new Promise(resolve => {
+      const run = new Run('books', '', []);
+      run.listeners.add(state => {
+        if (state.status === 'running') return;
+        this.libraryLoading = null;
+        if (state.books) { this.library = state.books; this.libraryAt = Date.now(); }
+        else if (!this.library) this.library = [];
+        resolve(this.library);
+      });
+      run.start(this.vaultPath());
+    });
+    return this.libraryLoading;
+  }
+
+  /** New EPUB in Apple Books or Downloads → generate its Chinese table of contents in the background. */
+  async autoScan() {
+    if (!this.settings.auto || (this.run && this.run.state.status === 'running')) return;
+    const items = await this.loadLibrary(true);
+    const next = autoCandidates(items, this.settings.since, this.settings.tried)[0];
+    this.refreshPanels();
+    if (!next) return;
+    this.settings.tried[next.path] = next.mtime;
+    await this.saveData(this.settings);
+    this.runTool('import', { path: next.path, name: displayName(next) }, ['--model', this.settings.model], { auto: true });
+  }
+
+  openModal(file) {
+    new MagazineModal(this.app, this, file).open();
+  }
+
+  vaultPath() {
+    const adapter = this.app.vault.adapter;
+    return adapter instanceof FileSystemAdapter ? adapter.getBasePath() : '';
+  }
+
+  /** Start the tool. Tracked runs (import/translate) are the single background job shown in the status bar. */
+  runTool(action, epub, extra, options) {
+    const track = !options || options.track !== false;
+    if (track && this.run && this.run.state.status === 'running') return this.run;
+    const run = new Run(action, epub.path, extra);
+    run.epub = epub;
+    run.picked = (options && options.picked) || [];
+    run.auto = Boolean(options && options.auto);
+    run.listeners.add(state => { if (state.issue) this.issues.set(run.epubPath, state.issue); });
+    if (track) {
+      this.run = run;
+      run.listeners.add(state => this.onRunState(run, state));
+    }
+    run.start(this.vaultPath());
+    return run;
+  }
+
+  clearRun() {
+    if (this.run && this.run.state.status === 'running') return;
+    this.run = null;
+    this.status.hide();
+    this.refreshPanels();
+  }
+
+  onRunState(run, state) {
+    if (this.run !== run) return;
+    if (state.status === 'running') {
+      if (run.action === 'translate') {
+        const ids = run.picked || [];
+        const done = ids.filter(id => state.articles[id] && state.articles[id].status === 'done').length;
+        this.status.setText(`中文稿 · 翻译 ${done}/${ids.length}`);
+      } else {
+        this.status.setText(`中文稿 · 生成目录：${run.epub.name}`);
+      }
+      this.status.show();
+      if (!run.shown) { run.shown = true; this.refreshPanels(); }
+      return;
+    }
+    if (run.announced) return;
+    run.announced = true;
+    this.libraryAt = 0; // library status changed
+    if (state.status === 'done') {
+      const failed = Object.values(state.articles).filter(a => a.status === 'failed').length;
+      if (run.action === 'translate') new Notice(`翻译完成${failed ? `，${failed} 个失败（再翻一次会补上）` : ''}`);
+      else if (run.auto) new Notice(`📰 已为新加入的《${run.epub.name}》生成中文目录。打开「中文稿工作台」或它的目录挑选要翻译的内容。`, 12000);
+      else new Notice('中文目录已生成');
+      this.status.setText(run.action === 'translate' ? '翻译完成' : '中文目录已生成');
+      if (state.issue && run.action === 'import' && !run.auto) this.openPath(state.issue.index);
+      window.setTimeout(() => { if (this.run === run) this.status.hide(); }, 8000);
+    } else if (state.status === 'error') {
+      this.status.setText('中文稿处理失败');
+      if (!run.auto) new Notice(`处理失败：${errorText(state)}`, 10000);
+    } else {
+      this.status.hide();
+    }
+    if (run.auto) {
+      // Automatic imports hand over to the next new EPUB (if any) instead of staying the "current" job.
+      window.setTimeout(() => {
+        if (this.run === run) { this.run = null; this.status.hide(); }
+        this.autoScan();
+      }, 5000);
+    }
+    this.refreshPanels();
+  }
+
+  async openPath(rel) {
+    let file = null;
+    for (let i = 0; i < 40 && !(file instanceof TFile); i++) {
+      file = this.app.vault.getAbstractFileByPath(rel);
+      if (!(file instanceof TFile)) await new Promise(r => window.setTimeout(r, 150));
+    }
+    const open = this.app.workspace.getLeavesOfType('markdown').find(leaf => leaf.view.file && leaf.view.file.path === rel);
+    if (open) this.app.workspace.setActiveLeaf(open, { focus: true });
+    else if (file instanceof TFile) await this.app.workspace.getLeaf('tab').openFile(file);
+    else await this.app.workspace.openLinkText(rel, '', 'tab');
+  }
+};
+
+module.exports.applyOutput = applyOutput;
+module.exports.errorText = errorText;
+module.exports.requestEstimate = requestEstimate;
+module.exports.fileToEpub = fileToEpub;
+module.exports.autoCandidates = autoCandidates;
+module.exports.Run = Run;
+module.exports.loginStatus = loginStatus;
+module.exports.newestCodex = newestCodex;
