@@ -780,7 +780,7 @@ def do_import(epub, model):
         for attempt in range(2):
             try:
                 prompt = TOC_PROMPT if kind != 'book' else TOC_PROMPT.replace('一期英文杂志的目录：每篇文章的栏目', '一本英文书的目录：每一章所在的部分')
-                result = ask(prompt + json.dumps(payload, ensure_ascii=False), 'toc', 300)[0]
+                result = ask(prompt + json.dumps(payload, ensure_ascii=False), 'toc', 600)[0]
                 break
             except QuotaError:
                 raise
@@ -833,17 +833,30 @@ CJK = re.compile(r'[㐀-鿿]')
 ENGLISH_RUN = re.compile(r'(?:\b[A-Za-z]+[ ,;:]+){8,}[A-Za-z]+')
 
 
+SMALL_WORDS = {'a', 'an', 'the', 'of', 'and', 'or', 'in', 'on', 'at', 'to', 'for', 'with', 'from', 'by', 'as', 'is', 'but'}
+
+
+def english_sentence(run):
+    """A long English run is a leftover sentence when its words are mostly lowercase; titles of films, books and
+    songs (kept in English on purpose, e.g. in listings) are mostly Capitalised."""
+    words = [w for w in re.findall(r'[A-Za-z]+', run) if w.lower() not in SMALL_WORDS]
+    lower = sum(1 for w in words if w[0].islower())
+    return bool(words) and lower / len(words) > 0.5
+
+
 def quality_problem(en, zh):
-    """Why a translated block looks wrong (None when it looks fine): untranslated, English left in, or so short
-    that something was left out. Chinese usually needs about 1.5 characters per English word."""
+    """Why a translated block looks wrong (None when it looks fine): untranslated, English sentence left in, or so
+    short that something was left out. Chinese usually needs about 1.5 characters per English word; English names
+    and titles kept as they are don't count towards that."""
     words = len(en.split())
     if not zh:
         return '空白'
     if words >= 5 and not CJK.search(zh):
         return '没有翻成中文'
-    if ENGLISH_RUN.search(zh):
+    if any(english_sentence(m.group(0)) for m in ENGLISH_RUN.finditer(zh)):
         return '夹杂整句英文'
-    if words >= 20 and len(CJK.findall(zh)) < 0.6 * words:
+    kept = len(re.findall(r'[A-Za-z]+', zh))
+    if words - kept >= 20 and len(CJK.findall(zh)) < 0.6 * (words - kept):
         return '明显比原文短，可能漏译'
     return None
 
@@ -915,7 +928,7 @@ def translate_article(epub, article, terms, kind='magazine'):
         got, rung, error = None, start, ''
         for attempt in range(3):  # network/service hiccups (e.g. the lid closed mid-request) retry on the same rung
             try:
-                result, model, rung = ask(article_prompt(kind) + json.dumps(payload, ensure_ascii=False), 'article', 300, start)
+                result, model, rung = ask(article_prompt(kind) + json.dumps(payload, ensure_ascii=False), 'article', 600, start)
             except QuotaError:
                 raise
             except Exception as exc:  # noqa: BLE001 - transient failure: wait a little and try again
@@ -946,7 +959,7 @@ def translate_article(epub, article, terms, kind='magazine'):
                        'doubt': problems[i] or (got.get(i) or {}).get('doubt', '')} for i in pending]
             body = {'title': article['title'], 'previous': previous,
                     'terms': terms.relevant(text + ' ' + ' '.join(x['en'] for x in review)), 'items': review}
-            result, model, rung = ask(REVIEW_PROMPT + json.dumps(body, ensure_ascii=False), 'article', 300, rung + 1)
+            result, model, rung = ask(REVIEW_PROMPT + json.dumps(body, ensure_ascii=False), 'article', 600, rung + 1)
             log(f'  《{title}》{len(pending)} 段没把握或不合格，用 {model} 校对')
             ESCALATED[0] += len(pending)
             for x in result.get('items', []):
@@ -1146,6 +1159,15 @@ def main():
     if not VAULT.is_dir():
         raise SystemExit(f'找不到 Obsidian 仓库：{VAULT}')
     write_schemas()
+    # One job per issue at a time (plugin, auto-import and command line could otherwise write the same issue).
+    import fcntl
+    lock_path = state_path(epub).parent / 'run.lock'
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock = lock_path.open('w')
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise SystemExit('这一期正在被另一个任务处理，请等它完成后再试。') from None
     t0 = time.monotonic()
     if args.action == 'import':
         state = do_import(epub, args.model)
