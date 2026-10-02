@@ -1,5 +1,5 @@
 'use strict';
-// Liuqing Podcast 中文稿: run the local Podcast-ZH tool from inside Obsidian.
+// Liuqing Podcast: run the local Podcast-ZH tool from inside Obsidian.
 // The tool (~/Applications/Podcast-ZH) does the work and writes the note; this plugin only starts it,
 // shows its progress, lets you cancel, and opens the finished note.
 const { Plugin, Modal, Notice, Setting, FileSystemAdapter, TFile, MarkdownRenderChild, setIcon } = require('obsidian');
@@ -150,7 +150,8 @@ function renderAccount(el, plugin, cls) {
 // ---------- end of ChatGPT account ----------
 
 
-const WORKBENCH = '中文稿工作台.md';
+const WORKBENCH = '工作台.md';
+const OLD_WORKBENCH = '中文稿工作台.md'; // its name before 2026-10-02
 
 const MODELS = {
   auto: '日常 · 省额度（GPT-5.6-Sol；不合格的段落逐级升级到最好的模型）',
@@ -369,7 +370,7 @@ class PodcastModal extends Modal {
       actions.addButton(b => b.setButtonText('取消').onClick(() => job.cancel()));
       actions.addButton(b => b.setButtonText('后台运行').setCta().onClick(() => this.close()));
     } else {
-      if (status === 'done') el.createDiv({ cls: 'lpz-muted', text: '文稿已在新标签页打开，位于「播客中文稿」文件夹。' });
+      if (status === 'done') el.createDiv({ cls: 'lpz-muted', text: '文稿已在新标签页打开，位于「播客」文件夹。' });
       if (status !== 'done') actions.addButton(b => b.setButtonText('重试').onClick(() => { this.plugin.startJob(job.source, job.model); this.render(); }));
       actions.addButton(b => b.setButtonText('再转一集').onClick(() => { this.plugin.clearJob(); this.render(); }));
       if (status === 'done') actions.addButton(b => b.setButtonText('完成').setCta().onClick(() => { this.plugin.clearJob(); this.close(); }));
@@ -482,7 +483,7 @@ module.exports = class PodcastZhPlugin extends Plugin {
     this.registerDomEvent(this.status, 'click', () => this.openModal());
     this.addRibbonIcon('podcast', '播客转中文稿', () => this.openModal());
     this.addCommand({ id: 'convert-episode', name: '把播客单集转成中文稿', callback: () => this.openModal() });
-    this.addCommand({ id: 'open-workbench', name: '打开中文稿工作台', callback: () => this.openWorkbench() });
+    this.addCommand({ id: 'open-workbench', name: '打开工作台', callback: () => this.openWorkbench() });
     this.addCommand({ id: 'login-chatgpt', name: '登录 ChatGPT（中文稿翻译用）', callback: () => this.startLogin() });
     this.panels = new Set();
     this.modals = new Set();
@@ -498,9 +499,9 @@ module.exports = class PodcastZhPlugin extends Plugin {
   }
 
   openWorkbench() {
-    const file = this.app.vault.getAbstractFileByPath(WORKBENCH);
-    if (file instanceof TFile) this.openNote(require('path').join(this.app.vault.adapter.getBasePath(), WORKBENCH));
-    else new Notice('找不到「中文稿工作台」笔记。');
+    const file = [WORKBENCH, OLD_WORKBENCH].map(p => this.app.vault.getAbstractFileByPath(p)).find(f => f instanceof TFile);
+    if (file) this.openNote(require('path').join(this.app.vault.adapter.getBasePath(), file.path));
+    else new Notice('找不到「工作台」笔记。');
   }
 
   refreshPanels() {
@@ -554,8 +555,8 @@ module.exports = class PodcastZhPlugin extends Plugin {
       this.status.show();
     } else if (state.status === 'done' && !job.announced) {
       job.announced = true;
-      this.status.setText('播客中文稿已完成');
-      new Notice('播客中文稿已完成');
+      this.status.setText('播客翻译已完成');
+      new Notice('播客翻译已完成');
       this.openNote(state.notePath);
       window.setTimeout(() => { if (this.job === job) this.status.hide(); }, 8000);
     } else if (state.status === 'error' && !job.announced) {

@@ -27,14 +27,14 @@ const empty = { status: 'running', steps: [], notePath: '', messages: [] };
 let s = empty;
 for (const line of ['① 查找这一集…', '  《Title》 · Show · 2026-09-28 · 09:25', '② 下载音频…', '③ 本机语音识别（英文）…',
   '  转写 40%', '  识别完成：15 段，约 1843 词，用时 00:08', '④ 生成要点和术语表（ChatGPT）…', '⑤ 翻译全文（ChatGPT gpt-6-luna）…',
-  '· 译文已有缓存，直接使用。', '  翻译 2/3 组', '✅ 完成，总用时 01:47。', '   文稿：/Users/x/liu/播客中文稿/2026-09-28 A - 富人.md', '']) {
+  '· 译文已有缓存，直接使用。', '  翻译 2/3 组', '✅ 完成，总用时 01:47。', '   文稿：/Users/x/liu/播客/2026-09-28 A - 富人.md', '']) {
   s = applyLine(s, line);
 }
 assert.strictEqual(s.steps.length, 6);
 assert.strictEqual(s.steps[0].detail, '《Title》 · Show · 2026-09-28 · 09:25');
 assert.strictEqual(s.steps[2].detail, '识别完成：15 段，约 1843 词，用时 00:08');
 assert.strictEqual(s.steps[4].detail, '翻译 2/3 组');
-assert.strictEqual(s.notePath, '/Users/x/liu/播客中文稿/2026-09-28 A - 富人.md');
+assert.strictEqual(s.notePath, '/Users/x/liu/播客/2026-09-28 A - 富人.md');
 assert.strictEqual(empty.steps.length, 0, 'applyLine must not mutate its input');
 
 let e = applyLine(empty, '② 下载音频…');

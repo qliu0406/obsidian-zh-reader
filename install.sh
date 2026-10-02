@@ -17,7 +17,7 @@ MT="$HOME/Applications/Magazine-ZH"
 
 mkdir -p "$PT/bin" "$MT"
 cp "$HERE/tools/podcast-zh/"{podcast_zh.py,apple_transcribe.swift,播客转中文.command,使用说明.md} "$PT/"
-cp "$HERE/tools/magazine-zh/"{magazine_zh.py,test_parse.py} "$MT/"
+cp "$HERE/tools/magazine-zh/"{magazine_zh.py,test_parse.py,test_folders.py} "$MT/"
 chmod +x "$PT/播客转中文.command"
 echo "$VAULT" > "$PT/vault.txt"
 echo "$VAULT" > "$MT/vault.txt"
@@ -33,8 +33,15 @@ for id in liuqing-podcast-zh liuqing-magazine-zh; do
   mkdir -p "$VAULT/.obsidian/plugins/$id"
   cp "$HERE/plugins/$id/"{manifest.json,main.js,styles.css} "$VAULT/.obsidian/plugins/$id/"
 done
-[ -e "$VAULT/中文稿工作台.md" ] || cp "$HERE/中文稿工作台.md" "$VAULT/"
+# The workbench note was called 中文稿工作台 before 2026-10-02.
+if [ -e "$VAULT/中文稿工作台.md" ] && [ ! -e "$VAULT/工作台.md" ]; then
+  mv "$VAULT/中文稿工作台.md" "$VAULT/工作台.md"
+  sed -i '' '1s/^# 中文稿工作台$/# 工作台/' "$VAULT/工作台.md"
+fi
+[ -e "$VAULT/工作台.md" ] || cp "$HERE/工作台.md" "$VAULT/"
+# Older versions wrote to 杂志中文稿 / 书籍中文稿: merge them into 杂志 / 书籍 and make the links relative.
+(cd "$MT" && "$TRANSLATOR/.runtime/python/bin/python3" -B magazine_zh.py tidy) || true
 
 echo
-echo "安装完成。重启 Obsidian，在「设置 → 第三方插件」里打开 Liuqing Podcast 中文稿 和 Liuqing Magazine 中文稿，"
-echo "然后打开仓库根目录的「中文稿工作台」。"
+echo "安装完成。重启 Obsidian，在「设置 → 第三方插件」里打开 Liuqing Podcast 和 Liuqing Magazine，"
+echo "然后打开仓库根目录的「工作台」。"

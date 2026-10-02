@@ -1,5 +1,5 @@
 'use strict';
-// Liuqing Magazine 中文稿: magazines and books (EPUB) from Apple Books, Downloads or anywhere → Chinese table of
+// Liuqing Magazine: magazines and books (EPUB) from Apple Books, Downloads or anywhere → Chinese table of
 // contents → pick articles/chapters → Chinese notes. The local Magazine-ZH tool does the work; this plugin shows
 // the library, starts the tool, follows its progress, and auto-generates the Chinese TOC for newly added EPUBs.
 const { Plugin, Modal, Notice, Setting, FileSystemAdapter, TFile, MarkdownRenderChild, setIcon } = require('obsidian');
@@ -744,7 +744,7 @@ module.exports = class MagazineZhPlugin extends Plugin {
       next = null;
     } else if (/登录已失效/.test(text)) {
       this.settings.pausedUntil = Date.now() + 30 * 60 * 1000;
-      new Notice('ChatGPT 需要重新登录：打开「中文稿工作台」的 ChatGPT 账号面板。', 15000);
+      new Notice('ChatGPT 需要重新登录：打开「工作台」的 ChatGPT 账号面板。', 15000);
       next = null;
     } else if (/为保证质量已停止/.test(text) || rec.attempts >= 6) {
       rec.gaveUp = true;

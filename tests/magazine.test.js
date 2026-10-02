@@ -46,12 +46,12 @@ assert.deepStrictEqual(fileToEpub({ name: 'The Economist 2026-09-26.EPUB', path:
 const empty = { status: 'running', log: [], issue: null, articles: {}, messages: [] };
 let s = applyOutput(empty, '① 解析 EPUB…');
 s = applyOutput(s, '@@ {"event":"article_start","id":3}');
-s = applyOutput(s, '@@ {"event":"article_done","id":3,"note":"杂志中文稿/X/03 标题.md"}');
+s = applyOutput(s, '@@ {"event":"article_done","id":3,"note":"杂志/X/03 标题.md"}');
 s = applyOutput(s, '@@ {"event":"article_failed","id":4,"error":"boom"}');
 s = applyOutput(s, '@@ {"event":"issue","issue":{"magazine":"M","articles":[]}}');
 s = applyOutput(s, '@@ not json');
 assert.deepStrictEqual(s.log, ['① 解析 EPUB…']);
-assert.strictEqual(s.articles[3].note, '杂志中文稿/X/03 标题.md');
+assert.strictEqual(s.articles[3].note, '杂志/X/03 标题.md');
 assert.strictEqual(s.articles[4].status, 'failed');
 assert.strictEqual(s.issue.magazine, 'M');
 assert.strictEqual(empty.log.length, 0);

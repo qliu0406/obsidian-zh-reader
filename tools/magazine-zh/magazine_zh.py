@@ -4,6 +4,10 @@
   magazine_zh.py status    <epub>              已导入的目录状态（不联网）
   magazine_zh.py import    <epub>              解析目录、翻译标题和简介、写「00 目录」
   magazine_zh.py translate <epub> --ids 3,5,9  翻译选中的文章，每篇一篇笔记
+  magazine_zh.py tidy                          把旧文件夹（杂志中文稿 / 书籍中文稿）并入 杂志 / 书籍，链接改成相对路径
+
+Notes go to 杂志/<刊名 日期>/ (books: 书籍/<书名>/), images to its images/ subfolder; links inside an issue are
+relative (./images/…), so moving or renaming the folder never breaks them.
 
 Runs with the Python bundled in the PhyrexNi translator and reuses its Codex binary and isolated
 ChatGPT login. Lines starting with "@@ " are JSON events for the Obsidian plugin; other lines are for people.
@@ -33,7 +37,10 @@ TRANSLATOR = Path(os.environ.get('MZH_TRANSLATOR', Path.home() / 'Applications/F
 # install.sh writes it to vault.txt next to this script.
 VAULT = Path(os.environ.get('MZH_VAULT') or ((HERE / 'vault.txt').read_text(encoding='utf-8').strip()
             if (HERE / 'vault.txt').is_file() else Path.home() / 'Documents/Obsidian Vault')).expanduser()
-FOLDER = '杂志中文稿'
+FOLDER = '杂志'
+BOOK_FOLDER = '书籍'
+# Top-level folders used before 2026-10-02; whatever is still in them is moved into the new ones on the next run.
+OLD_ROOTS = {'杂志中文稿': FOLDER, '书籍中文稿': BOOK_FOLDER}
 PARSER = 2  # bump when article splitting changes; older imports are re-split, keeping their Chinese TOC
 CACHE = HERE / 'cache'
 WORK = HERE / 'work'
@@ -505,7 +512,7 @@ def codex_failure(raw, model):
     if 'model' in low and ('not supported' in low or 'newer version' in low or 'does not exist' in low):
         return QuotaError(f'账号暂时用不了 {model}', 'model')
     if re.search(r'"status":\s*401|status code:? 401|unauthorized|refresh token|not logged in|token (is )?(expired|invalid)', low) and not logged_in():
-        return QuotaError('ChatGPT 登录已失效：请在「中文稿工作台」的 ChatGPT 账号面板里点「重新登录」，然后再继续。', 'login')
+        return QuotaError('ChatGPT 登录已失效：请在「工作台」的 ChatGPT 账号面板里点「重新登录」，然后再继续。', 'login')
     lines = [l.strip() for l in raw.splitlines() if re.search(r'error|failed|denied|timed out', l, re.I)]
     return RuntimeError((lines[-1] if lines else raw.strip()[-300:])[:300])
 
@@ -627,23 +634,188 @@ def safe_name(text, limit=80):
 
 
 def root(state):
-    return state.get('root', FOLDER)
+    return BOOK_FOLDER if state.get('kind') == 'book' else FOLDER
 
 
 def unit(state):
     return '章' if state.get('kind') == 'book' else '篇'
 
 
+def toc_match(toc, state):
+    """How well this '00 目录' note matches the issue: 2 = same magazine/book, date and number of articles (the
+    count tells the real issue from a test import carrying the same name), 1 = same name and date only, 0 = other."""
+    try:
+        head = toc.read_text(encoding='utf-8', errors='ignore')[:800]
+    except OSError:
+        return 0
+    title = json.dumps(state['magazine'], ensure_ascii=False)
+    if not ((f'magazine: {title}' in head or f'book: {title}' in head) and f'issue: {json.dumps(state["issue"])}' in head):
+        return 0
+    return 2 if f'共 {len(state["articles"])} {unit(state)}' in head else 1
+
+
+def owns(folder, state):
+    """Does this folder hold this issue: its table of contents, or (TOC missing or damaged) every note translated
+    so far? A folder whose TOC names another issue never does."""
+    toc = folder / '00 目录.md'
+    match = toc_match(toc, state)
+    if match == 2:
+        return True
+    if toc.is_file() and match == 0:
+        return False
+    notes = [Path(a['note']).name for a in state['articles'] if a.get('note')]
+    return bool(notes) and all((folder / n).is_file() for n in notes)
+
+
+def find_issue_dirs(state):
+    """Every folder in the vault (up to three levels deep) whose '00 目录' belongs to this issue, even if renamed."""
+    hits = []
+
+    def walk(folder, depth):
+        try:
+            entries = sorted(folder.iterdir())
+        except OSError:
+            return
+        for p in entries:
+            if not p.is_dir() or p.name.startswith('.') or p.name == 'images':
+                continue
+            if owns(p, state):
+                hits.append(p)
+            elif depth < 3:
+                walk(p, depth + 1)
+    walk(VAULT, 1)
+    return hits
+
+
 def issue_folder(state):
-    return VAULT / root(state) / state['folder']
+    """Where the issue's notes live: where they were last written, unless Liuqing has moved or renamed the folder
+    since — then wherever its '00 目录' is now; a new issue goes to 杂志/ (books to 书籍/)."""
+    where = VAULT / state.get('where', f"{root(state)}/{state['folder']}")
+    if owns(where, state):
+        return where
+    moved = [p for p in find_issue_dirs(state) if p.relative_to(VAULT).parts[0] not in OLD_ROOTS]
+    return moved[0] if moved else VAULT / root(state) / state['folder']
+
+
+def rel(path):
+    return path.relative_to(VAULT).as_posix()
 
 
 def public(state):
     """What the plugin needs to draw the article picker."""
+    folder = rel(issue_folder(state))
     return {'magazine': state['magazine'], 'issue': state['issue'], 'kind': state.get('kind', 'magazine'),
-            'folder': f"{root(state)}/{state['folder']}", 'index': f"{root(state)}/{state['folder']}/00 目录.md",
+            'folder': folder, 'index': f'{folder}/00 目录.md',
             'articles': [{k: a.get(k) for k in ('id', 'section', 'section_zh', 'title', 'title_zh', 'summary_zh', 'words', 'note')}
                          for a in state['articles']]}
+
+
+# ---------- keeping each issue in one folder ----------
+
+def merge_dir(src, dst):
+    """Move everything in src into dst (a file in both keeps the newer copy); src is removed once empty."""
+    dst.mkdir(parents=True, exist_ok=True)
+    for p in sorted(src.iterdir()):
+        q = dst / p.name
+        if p.is_dir() and not p.is_symlink():
+            merge_dir(p, q)
+        elif not q.exists() or p.stat().st_mtime > q.stat().st_mtime:
+            p.replace(q)
+        else:
+            p.unlink()
+    try:
+        src.rmdir()
+    except OSError:
+        pass
+
+
+def relink(folder, *names):
+    """Links between an issue's own notes and to its images become relative (./images/…, ./00 目录), so they keep
+    working wherever the folder is moved or renamed — inside Obsidian, in Finder or on the iPhone."""
+    alts = '|'.join(re.escape(n) for n in sorted({folder.name, *names}, key=len, reverse=True))
+    own = re.compile(r'(!?\[\[)(?:[^\[\]|#\n]*/)?(?:' + alts + ')/')
+    for note in folder.glob('*.md'):
+        text = note.read_text(encoding='utf-8')
+        new = own.sub(r'\1./', text)
+        if new != text:
+            note.write_text(new, encoding='utf-8')
+
+
+def move_old_roots():
+    """杂志中文稿/… and 书籍中文稿/… (the folder names before 2026-10-02) move into 杂志/ and 书籍/."""
+    moved = []
+    for old, new in OLD_ROOTS.items():
+        src = VAULT / old
+        if not src.is_dir():
+            continue
+        for p in sorted(src.iterdir()):
+            if p.is_dir():
+                merge_dir(p, VAULT / new / p.name)
+                moved.append(VAULT / new / p.name)
+            elif p.name != '.DS_Store':
+                (VAULT / new).mkdir(exist_ok=True)
+                if not (VAULT / new / p.name).exists():
+                    p.replace(VAULT / new / p.name)
+        for junk in src.glob('.DS_Store'):
+            junk.unlink()
+        try:
+            src.rmdir()
+        except OSError:
+            pass
+        log(f'· 已把「{old}」并入「{new}」')
+    for folder in moved:
+        relink(folder)
+
+
+def settle(state):
+    """Gather the issue into one folder (merging any copy left in an old or second place), make its links relative
+    and point the recorded note paths there. Returns True when the state changed."""
+    move_old_roots()
+    found = find_issue_dirs(state)
+    default = VAULT / root(state) / state['folder']
+    target = issue_folder(state)
+    if target.relative_to(VAULT).parts[0] in OLD_ROOTS:
+        target = default
+    for other in found:
+        if other != target and other.is_dir():
+            merge_dir(other, target)
+            log(f'· 已把「{rel(other)}」合并到「{rel(target)}」')
+    changed = state.get('where') != rel(target) or state.get('root') != root(state)
+    state['where'], state['root'] = rel(target), root(state)
+    for a in state['articles']:
+        if a.get('note') and a['note'] != f"{rel(target)}/{Path(a['note']).name}":
+            a['note'] = f"{rel(target)}/{Path(a['note']).name}"
+            changed = True
+    if owns(target, state):
+        relink(target, state['folder'])
+    return changed
+
+
+def tidy():
+    """One pass over every issue this tool knows: old folders merged, links made relative, paths updated.
+    Issues being translated right now are left alone (their own run settles them)."""
+    import fcntl
+    move_old_roots()
+    for path in sorted(CACHE.glob('*/issue.json')):
+        state = json.loads(path.read_text(encoding='utf-8'))
+        if not state.get('folder') or not state.get('articles'):
+            continue
+        lock = (path.parent / 'run.lock').open('w')
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            log(f'· {state["folder"]} 正在翻译，跳过')
+            continue
+        if settle(state):
+            tmp = path.with_suffix('.tmp')
+            tmp.write_text(json.dumps(state, ensure_ascii=False), encoding='utf-8')
+            tmp.replace(path)
+        folder = issue_folder(state)
+        if not owns(folder, state):  # never imported into this vault, deleted on purpose, or a test import: leave it
+            continue
+        if all(a.get('title_zh') for a in state['articles']):
+            write_index(None, state)
+        log(f'· {rel(folder)}：{sum(1 for a in state["articles"] if a.get("note"))}/{len(state["articles"])} {unit(state)}')
 
 
 # ---------- library: Apple Books (iCloud) and Downloads ----------
@@ -754,6 +926,8 @@ def do_import(epub, model):
     if state and all(a.get('title_zh') for a in state['articles']):
         log('· 这本已经导入过。')
         state = ensure_current(epub, state)
+        if settle(state):
+            save_state(epub, state)
         write_index(epub, state)
         return state
     log('① 解析 EPUB…')
@@ -771,8 +945,9 @@ def do_import(epub, model):
     word = '章' if kind == 'book' else '篇文章'
     log(f'  《{name}》 {date} · {len(articles)} {word} · {len(sections)} 个栏目 · 约 {sum(a["words"] for a in articles):,} 词')
     state = state or {}
-    state.update({'magazine': name, 'issue': date, 'kind': kind, 'root': '书籍中文稿' if kind == 'book' else FOLDER,
+    state.update({'magazine': name, 'issue': date, 'kind': kind, 'root': BOOK_FOLDER if kind == 'book' else FOLDER,
                   'epub': str(epub), 'folder': safe_name(f'{name} {date}'.strip()), 'articles': articles, 'parser': PARSER})
+    settle(state)
     save_state(epub, state)
     log('② 翻译目录（ChatGPT）…')
     groups = [articles[i:i + 40] for i in range(0, len(articles), 40)]
@@ -980,8 +1155,9 @@ def translate_article(epub, article, terms, kind='magazine'):
 ESCALATED = [0]  # blocks sent up the ladder in this run (for the summary line)
 
 
-def copy_image(z, src, folder, stem):
-    """Copy one image out of the EPUB into the note's images folder; tiny spacer/icon images are skipped."""
+def copy_image(z, src, folder, stem, written):
+    """Copy one image out of the EPUB into the note's images folder; tiny spacer/icon images are skipped.
+    Images actually (re)written are added to `written`."""
     try:
         data = z.read(src)
     except KeyError:
@@ -993,7 +1169,21 @@ def copy_image(z, src, folder, stem):
     target.parent.mkdir(parents=True, exist_ok=True)
     if not target.exists() or target.stat().st_size != len(data):
         target.write_bytes(data)
+        written.append(target)
     return target
+
+
+IMAGE_SETTLE_SECONDS = 1.5  # Obsidian must have indexed new images before the note embedding them appears
+
+
+def write_note_file(path, text, new_images):
+    """Write a note unless it is unchanged. When it embeds images written a moment ago, wait first: a note that shows
+    up before Obsidian has seen its images renders them as missing and does not redraw them later."""
+    if path.is_file() and path.read_text(encoding='utf-8', errors='ignore') == text:
+        return
+    if new_images:
+        time.sleep(IMAGE_SETTLE_SECONDS)
+    path.write_text(text, encoding='utf-8')
 
 
 def write_article(epub, state, article, zh, models):
@@ -1005,7 +1195,6 @@ def write_article(epub, state, article, zh, models):
     book = state.get('kind') == 'book'
     folder = issue_folder(state)
     folder.mkdir(parents=True, exist_ok=True)
-    rel_folder = f"{root(state)}/{state['folder']}"
     lines = ['---', f'title: {q(title_zh)}', f'original_title: {q(article["title"])}',
              f'{"book" if book else "magazine"}: {q(state["magazine"])}', f'issue: {q(state["issue"])}',
              f'section: {q(article["section"])}', f'created: {dt.date.today().isoformat()}',
@@ -1013,15 +1202,17 @@ def write_article(epub, state, article, zh, models):
              f'# {article["title"]}', '', f'**{title_zh}**', '', f'> {head}']
     if article.get('summary_zh'):
         lines.append(f'> {article["summary_zh"]}')
-    lines += ['', f'[[{rel_folder}/00 目录|← 返回目录]]', '']
+    # Relative links (./…): images and the table of contents stay attached however the folder is moved or renamed.
+    lines += ['', '[[./00 目录|← 返回目录]]', '']
     z = EpubSource(epub)
     n_image = 0
+    written = []
     for p, text in zip(article['paras'], zh):
         if p['kind'] == 'image':
             n_image += 1
-            saved = copy_image(z, p['src'], folder, f"{article['id']:02d}-{n_image}")
+            saved = copy_image(z, p['src'], folder, f"{article['id']:02d}-{n_image}", written)
             if saved:
-                lines += [f'![[{rel_folder}/images/{saved.name}]]', '']
+                lines += [f'![[./images/{saved.name}]]', '']
         elif p['kind'] == 'heading':
             lines += [f'### {p["text"]}', ''] + ([f'**{text}**', ''] if text else [])
         elif p['kind'] == 'caption':
@@ -1030,10 +1221,10 @@ def write_article(epub, state, article, zh, models):
             lines += [p['text'], ''] + ([text, ''] if text else [])
     name = safe_name(f"{article['id']:02d} {title_zh}") + '.md'
     old = article.get('note')
-    if old and old != f"{root(state)}/{state['folder']}/{name}":
+    if old and old != f'{rel(folder)}/{name}':
         (VAULT / old).unlink(missing_ok=True)
-    (folder / name).write_text('\n'.join(lines), encoding='utf-8')
-    return f"{root(state)}/{state['folder']}/{name}"
+    write_note_file(folder / name, '\n'.join(lines), written)
+    return f'{rel(folder)}/{name}'
 
 
 def write_index(epub, state):
@@ -1044,7 +1235,7 @@ def write_index(epub, state):
     lines = ['---', f'{"book" if book else "magazine"}: {json.dumps(state["magazine"], ensure_ascii=False)}',
              f'issue: {json.dumps(state["issue"])}', 'tags:', f'  - {"书籍" if book else "杂志"}', '  - 中文目录', '---', '',
              f'# {state["magazine"]} {state["issue"]} · 中文目录'.replace('  ', ' '), '',
-             f'> 共 {len(state["articles"])} {unit(state)}，已翻译 {done} {unit(state)}。想读哪{unit(state)}，在「中文稿工作台」或左侧栏的 📰 图标里勾选翻译。', '']
+             f'> 共 {len(state["articles"])} {unit(state)}，已翻译 {done} {unit(state)}。想读哪{unit(state)}，在「工作台」或左侧栏的 📰 图标里勾选翻译。', '']
     current = None
     for a in state['articles']:
         section = a.get('section') or ''
@@ -1055,10 +1246,10 @@ def write_index(epub, state):
         title = a.get('title_zh') or a['title']
         summary = f" — {a['summary_zh']}" if a.get('summary_zh') else ''
         if a.get('note'):
-            lines.append(f"- [[{a['note'][:-3]}|{title}]]{summary}")
+            lines.append(f"- [[./{Path(a['note']).stem}|{title}]]{summary}")
         else:
             lines.append(f"- {title}{summary} *（未翻译）*")
-    (folder / '00 目录.md').write_text('\n'.join(lines) + '\n', encoding='utf-8')
+    write_note_file(folder / '00 目录.md', '\n'.join(lines) + '\n', [])
 
 
 MAX_QUALITY_FAILURES = 3  # this many articles failing the quality checks means something is off: stop
@@ -1069,6 +1260,8 @@ def do_translate(epub, ids, jobs):
     if not state:
         raise SystemExit('这本还没导入，请先生成中文目录。')
     state = ensure_current(epub, state)
+    if settle(state):
+        save_state(epub, state)
     chosen = [a for a in state['articles'] if a['id'] in ids or 'all' in ids]
     if not chosen:
         raise SystemExit('没有选中要翻译的内容。')
@@ -1135,7 +1328,7 @@ def parse_ids(text):
 
 def main():
     parser = argparse.ArgumentParser(description='杂志 EPUB → Obsidian 中文稿')
-    parser.add_argument('action', choices=['books', 'status', 'import', 'translate'])
+    parser.add_argument('action', choices=['books', 'status', 'import', 'translate', 'tidy'])
     parser.add_argument('epub', nargs='?', default='')
     parser.add_argument('--ids', default='', help='要翻译的文章编号，逗号分隔')
     parser.add_argument('--model', default='auto', help='auto（日常 GPT-5.6-Sol，数据/金融文章高一级，没把握的段落逐级升级校对）或指定一个模型全程使用')
@@ -1146,6 +1339,11 @@ def main():
     MODEL.start(args.model)
     if args.action == 'books':
         event('books', items=list_library())
+        return
+    if args.action == 'tidy':
+        if not VAULT.is_dir():
+            raise SystemExit(f'找不到 Obsidian 仓库：{VAULT}')
+        tidy()
         return
     epub = Path(args.epub).expanduser().resolve()
     if not epub.exists():

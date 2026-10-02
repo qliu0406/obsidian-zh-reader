@@ -29,7 +29,8 @@ TRANSLATOR = Path(os.environ.get('PZH_TRANSLATOR', Path.home() / 'Applications/F
 # install.sh writes it to vault.txt next to this script.
 VAULT = Path(os.environ.get('PZH_VAULT') or ((HERE / 'vault.txt').read_text(encoding='utf-8').strip()
             if (HERE / 'vault.txt').is_file() else Path.home() / 'Documents/Obsidian Vault')).expanduser()
-FOLDER = '播客中文稿'
+FOLDER = '播客'
+OLD_FOLDER = '播客中文稿'  # the folder name before 2026-10-02; notes still there are moved into FOLDER
 CACHE = HERE / 'cache'
 WORK = HERE / 'work'
 UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) PodcastZH/1.0'
@@ -435,7 +436,7 @@ def codex_failure(raw, model):
     if 'model' in low and ('not supported' in low or 'newer version' in low or 'does not exist' in low):
         return QuotaError(f'账号暂时用不了 {model}', 'model')
     if re.search(r'"status":\s*401|status code:? 401|unauthorized|refresh token|not logged in|token (is )?(expired|invalid)', low) and not logged_in():
-        return QuotaError('ChatGPT 登录已失效：请在「中文稿工作台」的 ChatGPT 账号面板里点「重新登录」，然后再运行。', 'login')
+        return QuotaError('ChatGPT 登录已失效：请在「工作台」的 ChatGPT 账号面板里点「重新登录」，然后再运行。', 'login')
     lines = [l.strip() for l in raw.splitlines() if re.search(r'error|failed|denied|timed out', l, re.I)]
     return RuntimeError((lines[-1] if lines else raw.strip()[-300:])[:300])
 
@@ -607,6 +608,27 @@ def safe_name(text, limit=90):
     return re.sub(r'\s+', ' ', text)[:limit].strip() or '未命名播客'
 
 
+def move_old_folder():
+    """Notes left in 播客中文稿/ move into 播客/ (a note in both keeps the newer copy); the old folder goes when empty."""
+    old = VAULT / OLD_FOLDER
+    if not old.is_dir():
+        return
+    (VAULT / FOLDER).mkdir(exist_ok=True)
+    for p in sorted(old.iterdir()):
+        q = VAULT / FOLDER / p.name
+        if p.name == '.DS_Store':
+            p.unlink()
+        elif not q.exists() or (p.is_file() and q.is_file() and p.stat().st_mtime > q.stat().st_mtime):
+            p.replace(q)
+        elif p.is_file():
+            p.unlink()
+    try:
+        old.rmdir()
+        log(f'· 已把「{OLD_FOLDER}」并入「{FOLDER}」')
+    except OSError:
+        pass
+
+
 def write_note(ep, paras, zh, summary, model, duration, engine):
     title_zh = (summary.get('title_zh') or ep['title']).strip()
     q = lambda s: json.dumps(s or '', ensure_ascii=False)
@@ -629,6 +651,7 @@ def write_note(ep, paras, zh, summary, model, duration, engine):
             lines += [f'> [!example]- [{stamp}] 广告 / 节目推广', f'> {result["zh"]}', '>', f'> *原文：* {p["en"]}', '']
         else:
             lines += [f'**[{stamp}]** {result["zh"]}', '', '> [!quote]- 原文', f'> {p["en"]}', '']
+    move_old_folder()
     folder = VAULT / FOLDER
     folder.mkdir(parents=True, exist_ok=True)
     # Re-running the same episode replaces its earlier note instead of adding a duplicate.
@@ -670,6 +693,7 @@ def main():
         raise SystemExit(f'找不到 Obsidian 仓库：{VAULT}')
     CACHE.mkdir(exist_ok=True)
     write_schemas()
+    move_old_folder()
     t0 = time.monotonic()
 
     log('① 查找这一集…')
